@@ -1,0 +1,41 @@
+# Python bytecode and test artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local Python environments
+.venv/
+venv/
+env/
+ENV/
+
+# Local configuration and credentials
+/config.json
+.env
+.env.*
+!.env.example
+secrets.*
+*.pem
+*.key
+*.p12
+
+# Local workbooks may contain inventories, vendor lists, templates, or reports
+*.xlsx
+
+# Generated report data, caches, and logs
+/reports/
+/data/
+/logs/
+*.db
+*.sqlite
+*.sqlite3
+*.log
+
+# Editor and operating-system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

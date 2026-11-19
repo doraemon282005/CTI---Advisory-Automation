@@ -1,0 +1,92 @@
+CTI ADVISORY SURVEILLANCE - WINDOWS COMMANDS
+============================================
+
+Run these commands in PowerShell from the Codebase folder:
+C:\Users\PwC\Desktop\Advisory API\Codebase
+
+1. Initial setup
+---------------
+Install Python 3 (the Windows Python launcher "py" should be available), then install
+the project's third-party packages:
+
+    py -3 -m pip install --upgrade pip
+    py -3 -m pip install requests urllib3 openpyxl
+
+The project reads its Inoreader and AI settings from config.json. Optional NVD and
+Tenable credentials can be set for your Windows user; replace the placeholders locally:
+
+    [Environment]::SetEnvironmentVariable("NVD_API_KEY", "<your-nvd-api-key>", "User")
+    [Environment]::SetEnvironmentVariable("TENABLE_ACCESS_KEY", "<your-tenable-access-key>", "User")
+    [Environment]::SetEnvironmentVariable("TENABLE_SECRET_KEY", "<your-tenable-secret-key>", "User")
+    [Environment]::SetEnvironmentVariable("TENABLE_BASE_URL", "https://cloud.tenable.com", "User")
+
+Open a new terminal after setting environment variables. Never put real API keys or
+passwords in this file or commit them to source control.
+
+2. Run immediately
+------------------
+Run the normal daily scan:
+
+    .\run_daily.bat
+
+Equivalent direct commands:
+
+    py -3 "src\pipeline.py"
+    py -3 "src\pipeline.py" --hours 48
+    py -3 "src\pipeline.py" --force
+
+Rebuild existing reports without fetching new feed items:
+
+    py -3 "src\pipeline.py" --refresh-reports
+
+After reviewing the daily workbook, generate selected report sheets and update the
+category master workbooks:
+
+    py -3 "src\pipeline.py" --process-reviewed
+
+The three daily category workbooks are saved together under:
+
+    reports\daily\YYYY-MM-DD\
+
+Run a forced full scan using the included batch file:
+
+    .\run_full_scan.bat
+
+3. Schedule the automatic daily run (5:00 AM)
+---------------------------------------------
+Create or update the Windows Scheduled Task:
+
+    powershell -ExecutionPolicy Bypass -File .\schedule_task.ps1
+
+Start the scheduled task now:
+
+    Start-ScheduledTask -TaskName "CTI_Application_Advisory_Surveillance"
+
+Check its state and last result:
+
+    Get-ScheduledTask -TaskName "CTI_Application_Advisory_Surveillance"
+    Get-ScheduledTaskInfo -TaskName "CTI_Application_Advisory_Surveillance"
+
+4. Pause, resume, or stop the schedule
+--------------------------------------
+Temporarily prevent future runs:
+
+    Disable-ScheduledTask -TaskName "CTI_Application_Advisory_Surveillance"
+
+Resume the schedule:
+
+    Enable-ScheduledTask -TaskName "CTI_Application_Advisory_Surveillance"
+
+Stop an execution that is currently running:
+
+    Stop-ScheduledTask -TaskName "CTI_Application_Advisory_Surveillance"
+
+5. Remove the scheduled task
+----------------------------
+This removes only the scheduled task; it does not delete project files or reports:
+
+    Unregister-ScheduledTask -TaskName "CTI_Application_Advisory_Surveillance" -Confirm:$false
+
+Verify removal:
+
+    Get-ScheduledTask -TaskName "CTI_Application_Advisory_Surveillance" -ErrorAction SilentlyContinue

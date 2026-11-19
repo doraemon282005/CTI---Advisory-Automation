@@ -1,0 +1,4 @@
+
+1. Recommendation : NA 
+2. plugin in CVE
+3. NVD API key

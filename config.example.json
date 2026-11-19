@@ -1,0 +1,48 @@
+{
+    "inoreader": {
+        "email": "",
+        "password": "",
+        "app_id": "",
+        "app_key": "",
+        "token": "",
+        "stream_id": "user/-/state/com.google/reading-list",
+        "fetch_full_web": true,
+        "verify_ssl": true,
+        "use_mock_if_missing": false
+    },
+    "gemini": {
+        "api_key": "",
+        "model": "gemini-2.5-flash",
+        "verify_ssl": true,
+        "use_fallback_if_missing": true
+    },
+    "openai": {
+        "api_key": "",
+        "model": "gpt-4o-mini"
+    },
+    "nvd": {
+        "api_key": ""
+    },
+    "tenable": {
+        "access_key": "",
+        "secret_key": "",
+        "base_url": "https://cloud.tenable.com"
+    },
+    "time_window_hours": 24,
+    "paths": {
+        "inventory_excel": "inventory.xlsx",
+        "master_excel": "reports/Master_Advisories.xlsx",
+        "daily_reports_dir": "reports/daily",
+        "cache_db": "data/advisory_cache.db",
+        "log_dir": "logs",
+        "telecom_list_excel": "Global Telecom List.xlsx",
+        "vendor_list_excel": "Vendor List.xlsx",
+        "master_telecom_excel": "reports/Master_Telecom_Advisories.xlsx",
+        "master_vendor_excel": "reports/Master_Vendor_Advisories.xlsx",
+        "master_miscellaneous_excel": "reports/Master_Miscellaneous_Advisories.xlsx"
+    },
+    "matching": {
+        "case_sensitive": false,
+        "min_word_length": 3
+    }
+}
