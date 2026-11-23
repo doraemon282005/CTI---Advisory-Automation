@@ -19,7 +19,11 @@ All four daily workbooks are grouped in one `reports/daily/YYYY-MM-DD/` folder f
 
 Each daily Summary stages candidates as `Selected` by default; review each category workbook before running `--process-reviewed`. The original `Master_Advisories.xlsx` is retained unchanged as a legacy backup. Its historical Summary records are copied into the three category archives.
 
-The default Inoreader window is the previous local calendar day, from midnight inclusive to today's midnight exclusive, regardless of report-generation time. The feed is paginated through all available articles in the window; there is no per-run article-count cap. `--hours N` scans the N-hour window ending at today's local midnight.
+The default Inoreader window is the previous local calendar day, from midnight inclusive to today's midnight exclusive, regardless of report-generation time. Window eligibility uses Inoreader's crawl timestamp so newly discovered articles are not dropped because a publisher's original publication date is older; the publisher date remains the date shown in reports. The feed is paginated through all available articles in the window; there is no per-run article-count cap. `--hours N` scans the N-hour window ending at today's local midnight.
+
+### Cross-source duplicate handling
+
+The pipeline compares each candidate with both other candidates in the scan and records already in the category archives. It analyzes the full source article, advisory title, primary CVEs, product identity, vulnerability class, and version details; a shared CVE alone or a broad inventory match is not enough to merge unrelated issues. Without a shared primary CVE, merging requires a strong full-article match plus either the same vulnerability class or distinctive matching title details. High-confidence matches become one advisory even when sources list different additional CVEs; distinct summary and remediation details are combined, and repeated sentences are removed. All source names and links remain in **Other Sources**, including matches found in later runs. Possible but uncertain matches are kept separate, marked **Pending**, and described in **Duplicate Check** for human review.
 
 Transient Inoreader connection failures are retried up to two times with a short backoff. If the feed still cannot be reached, the run stops with an error rather than substituting sample data; check the network connection and Inoreader availability before retrying.
 
@@ -29,6 +33,8 @@ Transient Inoreader connection failures are retried up to two times with a short
 2. Review the Summary sheet in each daily workbook and confirm or change `Review Decision`: `☑ Selected`, `☐ Pending`, or `☒ Rejected`. `Model Suggestion` is advisory only.
 3. Run `python "src\pipeline.py" --process-reviewed`. This processes every available category workbook. Detailed report sheets are generated only for items left `Selected` with non-LOW severity. After each daily report is saved successfully, its records are appended to the corresponding category archive. Pending, rejected, and LOW advisories never get detailed sheets.
 4. Open the **Learning Tracker** sheet in each category master workbook for its status view. Only human Selected/Rejected decisions count as training labels.
+
+If the daily pipeline is rerun on the same date, that date's existing master rows are ignored during duplicate matching so the fresh scan can rebuild the review workbooks. When `--process-reviewed` saves the new reviewed batch, it replaces that date's rows and report tabs in the master archive while preserving records from earlier dates.
 
 The first local learner is an explainable, weighted Naive Bayes baseline using advisory text, matched applications, severity, and advisory type. It retrains from human `Selected` and `Rejected` decisions in the Master Summary on later runs. Suggestions begin only after at least five labels in each class. The Learning Tracker reports cross-validated metrics and recurring terms; these are early indicators, not a guarantee of production accuracy. The model never selects or publishes advisories. Corrected decisions are used on the next run. Advisory format examples are templates, not relevance labels. Detailed report sheets are created only for items left `Selected` after human review. Threat details, summaries, and recommendations are rendered as concise bullet points; the source link remains available for context.
 
@@ -63,11 +69,18 @@ Each summary row includes a **View Report** button after the vendor link. It ope
 | **3** | **Advisory Heading** | Clean technical title including CVE identifiers |
 | **4** | **Link of Advisory** | Clickable blue hyperlink opening directly to the vendor advisory |
 | **5** | **View Report** | Button linking directly to the generated report sheet; displays `Not generated` until a report exists |
-| **6** | **Severity** | Color-coded badge (`CRITICAL` [Red], `HIGH` [Orange], `MEDIUM` [Yellow], `LOW` [Green]) |
-| **7** | **CVSS** | Extracted CVSS Base Score (e.g., 9.8, 8.6) |
-| **8** | **Published Date & Time** | Original publication timestamp (`YYYY-MM-DD HH:MM`) |
-| **9** | **Security Impact / Summary** | Technical summary describing the vulnerability mechanics, exploit vectors (RCE, Auth Bypass, DoS, Info Disclosure), and affected software components |
-| **10** | **Matched Application / Component** | Which specific asset from your inventory triggered the alert |
+| **6** | **Other Sources** | Additional source names and links consolidated for the same issue |
+| **7** | **Duplicate Check** | Possible duplicate details requiring human comparison; blank when no uncertainty was found |
+| **8** | **Severity** | Color-coded badge (`CRITICAL` [Red], `HIGH` [Orange], `MEDIUM` [Yellow], `LOW` [Green]) |
+| **9** | **CVSS** | Extracted CVSS Base Score (e.g., 9.8, 8.6) |
+| **10** | **Published Date & Time** | Original publication timestamp (`YYYY-MM-DD HH:MM`) |
+| **11** | **Security Impact / Summary** | Technical summary describing the vulnerability mechanics, exploit vectors (RCE, Auth Bypass, DoS, Info Disclosure), and affected software components |
+| **12** | **Matched Application / Component** | Which specific asset from your inventory triggered the alert |
+| **13** | **CVE Details** | CVE identifiers and descriptions |
+| **14** | **CVE Risk Score** | CVSS risk score when available |
+| **15** | **Attack Vector** | Source-reported or enriched attack vector |
+| **16** | **AV Type** | Attack-vector category |
+| **17** | **IOCs** | Defanged indicators of compromise |
 
 ---
 

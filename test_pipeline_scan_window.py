@@ -1,7 +1,7 @@
 import sys
 import tempfile
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -12,6 +12,18 @@ from pipeline import calculate_scan_window, is_in_scan_window
 
 
 class ScanWindowTests(unittest.TestCase):
+    def test_today_archive_records_can_be_identified_for_reruns(self):
+        today = datetime.now().date()
+
+        self.assertTrue(pipeline._is_recorded_on_date(
+            f"{today.isoformat()} 08:15",
+            today,
+        ))
+        self.assertFalse(pipeline._is_recorded_on_date(
+            f"{(today - timedelta(days=1)).isoformat()} 08:15",
+            today,
+        ))
+
     def test_default_window_is_previous_local_calendar_day(self):
         start, end = calculate_scan_window(datetime(2026, 11, 12, 16, 45))
 
@@ -155,7 +167,8 @@ class ScanWindowTests(unittest.TestCase):
                 "content": "Advisory content",
                 "source_name": "Vendor",
                 "link": "",
-                "published_timestamp": 150,
+                "published_timestamp": 50,
+                "scan_timestamp": 150,
             }
             enriched = {
                 "source_name": "Vendor",
@@ -236,6 +249,132 @@ class ScanWindowTests(unittest.TestCase):
             self.assertEqual(info_path.parent, daily_dir / today_str)
             self.assertTrue(all(path.parent == info_path.parent for path, _, _ in exports.values()))
             self.assertTrue(info_options["replace_existing"])
+
+    def test_same_issue_from_two_sources_is_queued_once_with_both_sources(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            inventory_path = root / "inventory.xlsx"
+            inventory_path.touch()
+            daily_dir = root / "daily"
+            config_paths = {
+                ("paths", "inventory_excel"): str(inventory_path),
+                ("paths", "master_excel"): str(root / "master.xlsx"),
+                ("paths", "master_telecom_excel"): str(root / "master-telecom.xlsx"),
+                ("paths", "master_vendor_excel"): str(root / "master-vendor.xlsx"),
+                ("paths", "master_miscellaneous_excel"): str(root / "master-miscellaneous.xlsx"),
+                ("paths", "daily_reports_dir"): str(daily_dir),
+                ("paths", "cache_db"): str(root / "cache.db"),
+            }
+
+            class TestConfig:
+                def get(self, *keys, default=None):
+                    return config_paths.get(keys, default)
+
+            class MatchingInventory:
+                applications = ["Apache Ignite"]
+
+                def __init__(self, _path):
+                    pass
+
+                def match(self, _title, _content):
+                    return [{
+                        "application_name": "Apache Ignite",
+                        "vendor": "Apache",
+                    }]
+
+            class EmptyNameMatcher:
+                def __init__(self, *_args, **_kwargs):
+                    pass
+
+                def match(self, _text):
+                    return []
+
+            articles = [
+                {
+                    "id": "source-a",
+                    "title": "Apache Ignite RCE CVE-2026-12345",
+                    "content": "Remote code execution affects Apache Ignite CVE-2026-12345.",
+                    "source_name": "Source A",
+                    "link": "https://a.example/advisory",
+                    "published_timestamp": 150,
+                },
+                {
+                    "id": "source-b",
+                    "title": "Ignite vulnerability CVE-2026-12345",
+                    "content": "Apache Ignite CVE-2026-12345 permits remote code execution.",
+                    "source_name": "Source B",
+                    "link": "https://b.example/advisory",
+                    "published_timestamp": 150,
+                },
+            ]
+            exporter = Mock()
+            exporter.build_advisory_record.side_effect = (
+                lambda advisory, evaluation, **_kwargs: {
+                    "source_name": advisory["source_name"],
+                    "advisory_heading": evaluation["advisory_heading"],
+                    "link": advisory["link"],
+                    "severity": "HIGH",
+                    "cvss_score": "8.5",
+                    "published_timestamp": advisory["published_timestamp"],
+                    "impact_summary": evaluation["impact_summary"],
+                    "matched_app_name": advisory["matched_app_name"],
+                    "matched_vendor": advisory["matched_vendor"],
+                    "advisory_type": "Actionable",
+                    "cve_details": "CVE-2026-12345",
+                    "cve_risk_score": "NA",
+                    "cve_metrics": {},
+                    "attack_vector": "NA",
+                    "av_type": "NA",
+                    "iocs": "NA",
+                    "affected_products": "Apache Ignite",
+                    "affected_versions": "2.0.0",
+                    "report_summary": evaluation["report_summary"],
+                    "recommendation": "",
+                    "source_content": advisory["content"],
+                }
+            )
+            exporter.export_daily.side_effect = lambda path, *_args, **_kwargs: path
+            cache = Mock()
+            cache.is_seen.return_value = False
+            client = Mock()
+            client.fetch_articles.return_value = articles
+            client.enrich_article_content.side_effect = lambda article: article
+            client.web_fetch_failures = 0
+            evaluator = Mock()
+            evaluator.evaluate_advisory.side_effect = lambda article, _match: {
+                "is_actionable_vulnerability": True,
+                "translated_title": article["title"],
+                "translated_content": article["content"],
+                "advisory_heading": article["title"],
+                "impact_summary": "Remote code execution affects Apache Ignite.",
+                "report_summary": article["content"],
+            }
+
+            with (
+                patch.object(pipeline, "Config", return_value=TestConfig()),
+                patch.object(pipeline, "resolve_path", side_effect=Path),
+                patch.object(pipeline, "calculate_scan_window", return_value=(100, 200)),
+                patch.object(pipeline, "create_exporter", return_value=exporter),
+                patch.object(pipeline, "ApplicationInventory", MatchingInventory),
+                patch.object(pipeline, "NameListMatcher", EmptyNameMatcher),
+                patch.object(pipeline, "AdvisoryCacheDB", return_value=cache),
+                patch.object(pipeline, "InoreaderClient", return_value=client),
+                patch.object(pipeline, "SecurityAIEvaluator", return_value=evaluator),
+            ):
+                pipeline.run_pipeline()
+
+            miscellaneous = next(
+                call.args[1]
+                for call in exporter.export_daily.call_args_list
+                if "Daily_Miscellaneous_Advisories_" in call.args[0]
+            )
+
+        self.assertEqual(len(miscellaneous), 1)
+        self.assertEqual(
+            [reference["source_name"] for reference in miscellaneous[0]["source_references"]],
+            ["Source A", "Source B"],
+        )
+        self.assertEqual(cache.mark_seen.call_count, 2)
 
 
 if __name__ == "__main__":

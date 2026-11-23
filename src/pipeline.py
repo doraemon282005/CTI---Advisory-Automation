@@ -1,8 +1,11 @@
 import sys
 import argparse
+import base64
+import os
 import re
+import subprocess
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, time, timedelta
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -10,6 +13,7 @@ from typing import Optional
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from config import Config, BASE_DIR
+from advisory_deduplicator import AdvisoryDeduplicator
 from inventory_manager import ApplicationInventory, NameListMatcher
 from inoreader_client import InoreaderClient
 from ai_evaluator import SecurityAIEvaluator
@@ -42,6 +46,14 @@ def is_in_scan_window(published_timestamp: int, window_start: int, window_end: i
     return not published_timestamp or window_start <= published_timestamp < window_end
 
 
+def _is_recorded_on_date(recorded_date, target_date: date) -> bool:
+    if isinstance(recorded_date, datetime):
+        return recorded_date.date() == target_date
+    if isinstance(recorded_date, date):
+        return recorded_date == target_date
+    return str(recorded_date or "").strip()[:10] == target_date.isoformat()
+
+
 def create_exporter(config: Config) -> AdvisoryExcelExporter:
     tenable_cfg = config.get("tenable", default={})
     return AdvisoryExcelExporter(
@@ -52,6 +64,66 @@ def create_exporter(config: Config) -> AdvisoryExcelExporter:
             base_url=tenable_cfg.get("base_url", "https://cloud.tenable.com"),
         ),
     )
+
+
+def _close_excel_workbook_if_open(workbook_path: Path) -> None:
+    """Close a matching workbook in Excel, saving its current edits before processing."""
+    if os.name != "nt":
+        return
+    target_path = str(workbook_path.resolve()).replace("'", "''")
+    script = f"""
+$ErrorActionPreference = 'Stop'
+try {{
+    $excel = [Runtime.InteropServices.Marshal]::GetActiveObject('Excel.Application')
+}} catch [System.Runtime.InteropServices.COMException] {{
+    Write-Output 'NO_EXCEL'
+    exit 0
+}}
+$target = [IO.Path]::GetFullPath('{target_path}')
+for ($index = $excel.Workbooks.Count; $index -ge 1; $index--) {{
+    $workbook = $excel.Workbooks.Item($index)
+    if ([string]::Equals(
+        [IO.Path]::GetFullPath($workbook.FullName),
+        $target,
+        [StringComparison]::OrdinalIgnoreCase
+    )) {{
+        $workbook.Close($true)
+        Write-Output 'CLOSED'
+        exit 0
+    }}
+}}
+Write-Output 'NOT_OPEN'
+"""
+    encoded_script = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+    try:
+        result = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-EncodedCommand",
+                encoded_script,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(
+            f"Could not check or close Excel workbook '{workbook_path}': {exc}"
+        ) from exc
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Could not close Excel workbook '{workbook_path}': "
+            f"{result.stderr.strip() or result.stdout.strip()}"
+        )
+    status = result.stdout.strip().splitlines()[-1:] or [""]
+    if status[0] not in {"CLOSED", "NOT_OPEN", "NO_EXCEL"}:
+        raise RuntimeError(
+            f"Unexpected response while checking Excel workbook "
+            f"'{workbook_path}': {result.stdout.strip()}"
+        )
 
 
 def build_report_groups(config: Config, daily_dir: Path, today_str: str):
@@ -239,11 +311,14 @@ def process_reviewed_advisories(
             f"Today's daily review workbook was not found: {daily_path}"
         )
 
+    _close_excel_workbook_if_open(daily_path)
+    _close_excel_workbook_if_open(master_file)
     daily_records = exporter.read_summary_records(str(daily_path))
     saved_daily = exporter.export_daily(
         str(daily_path),
         daily_records,
         generate_documents=True,
+        replace_existing=True,
     )
 
     # Read back the successfully saved daily workbook so enrichment is carried into the archive.
@@ -254,6 +329,8 @@ def process_reviewed_advisories(
         generate_documents=True,
         update_learning_tracker=True,
         preserve_review_decisions=False,
+        replace_existing=True,
+        replace_recorded_date=datetime.now().date(),
     )
 
     selected_count = sum(
@@ -511,8 +588,9 @@ def run_pipeline(
     for article in raw_articles:
         art_id = str(article.get("id") or "").strip()
         pub_ts = article.get("published_timestamp", 0)
+        scan_ts = article.get("scan_timestamp", pub_ts)
 
-        if not is_in_scan_window(pub_ts, window_start_ts, window_end_ts):
+        if not is_in_scan_window(scan_ts, window_start_ts, window_end_ts):
             skipped_outside_window += 1
             continue
 
@@ -596,21 +674,15 @@ def run_pipeline(
         return
 
     # 5. Security Impact Analysis & Precision Triage
-    flagged_by_triage = 0
-
     with ThreadPoolExecutor(max_workers=4) as executor:
         evaluations = list(executor.map(
             lambda item: ai_evaluator.evaluate_advisory(item[1], item[2]),
             unseen_matched,
         ))
 
-    processed_by_group = {group: [] for group in report_groups}
-    informational_advisories = []
+    scanned_records = []
     for (group, art, primary_match, all_matches), evaluation in zip(unseen_matched, evaluations):
         initially_actionable = bool(evaluation.get("is_actionable_vulnerability", True))
-        if not initially_actionable:
-            flagged_by_triage += 1
-
         art = {
             **art,
             "title": evaluation.get("translated_title", art.get("title", "")),
@@ -667,7 +739,36 @@ def run_pipeline(
             "initial_triage": "Accepted" if initially_actionable else "Flagged",
             "triage_note": triage_note,
             "review_decision": "☑ Selected",
+            "_dedupe_group": group,
         }
+        scanned_records.append(record)
+
+    training_records = []
+    archived_records = []
+    for group, paths in report_groups.items():
+        if not paths["master_path"].exists():
+            continue
+        master_records = [
+            record
+            for record in exporter.read_summary_records(str(paths["master_path"]))
+            if not _is_recorded_on_date(
+                record.get("recorded_date"),
+                window_end.date(),
+            )
+        ]
+        training_records.extend(master_records)
+        for master_record in master_records:
+            master_record["_archive_group"] = group
+            archived_records.append(master_record)
+
+    deduplicated_records, archived_updates = AdvisoryDeduplicator().deduplicate(
+        scanned_records,
+        archived_records,
+    )
+    processed_by_group = {group: [] for group in report_groups}
+    informational_advisories = []
+    for record in deduplicated_records:
+        group = record.pop("_dedupe_group")
         if record["advisory_type"] == "Information":
             informational_advisories.append(record)
         else:
@@ -677,23 +778,42 @@ def run_pipeline(
         sum(len(records) for records in processed_by_group.values())
         + len(informational_advisories)
     )
+    flagged_by_triage = sum(
+        1
+        for record in deduplicated_records
+        if str(record.get("initial_triage") or "").casefold() == "flagged"
+    )
     print(
         f"Review queue: {candidate_count} candidates; "
         f"{flagged_by_triage} flagged by initial triage."
     )
 
-    training_records = []
-    for paths in report_groups.values():
-        if paths["master_path"].exists():
-            training_records.extend(
-                exporter.read_summary_records(str(paths["master_path"]))
-            )
     processed_advisories = [
         record
         for records in processed_by_group.values()
         for record in records
     ] + informational_advisories
+    training_records = [
+        {
+            key: value
+            for key, value in record.items()
+            if not key.startswith("_")
+        }
+        for record in training_records
+    ]
     exporter.apply_relevance_suggestions(processed_advisories, training_records)
+
+    for group, updates in archived_updates.items():
+        master_path = report_groups[group]["master_path"]
+        _close_excel_workbook_if_open(master_path)
+        exporter.append_to_master(
+            str(master_path),
+            updates,
+            generate_documents=False,
+            preserve_review_decisions=True,
+            replace_existing=True,
+        )
+
     saved_daily_reports = []
     for group, group_records in processed_by_group.items():
         saved_daily_reports.append(exporter.export_daily(
@@ -712,14 +832,33 @@ def run_pipeline(
 
     # Record in cache database
     for item in processed_advisories:
-        cache_db.mark_seen(
-            article_id=item["id"],
-            title=item["advisory_heading"],
-            source=item["source_name"],
-            matched_app=item["matched_app_name"],
-            severity=item["severity"],
-            timestamp=item["published_timestamp"]
-        )
+        article_ids = [item.get("id"), *item.get("_deduplicated_article_ids", [])]
+        for article_id in dict.fromkeys(
+            str(value).strip() for value in article_ids if str(value or "").strip()
+        ):
+            cache_db.mark_seen(
+                article_id=article_id,
+                title=item["advisory_heading"],
+                source=item["source_name"],
+                matched_app=item["matched_app_name"],
+                severity=item["severity"],
+                timestamp=item["published_timestamp"],
+            )
+    for updates in archived_updates.values():
+        for item in updates:
+            for article_id in dict.fromkeys(
+                str(value).strip()
+                for value in item.get("_deduplicated_article_ids", [])
+                if str(value or "").strip()
+            ):
+                cache_db.mark_seen(
+                    article_id=article_id,
+                    title=item["advisory_heading"],
+                    source=item["source_name"],
+                    matched_app=item["matched_app_name"],
+                    severity=item["severity"],
+                    timestamp=item["published_timestamp"],
+                )
 
     print(
         "Daily summaries saved: "

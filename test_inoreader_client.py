@@ -11,6 +11,46 @@ from inoreader_client import InoreaderClient
 
 
 class InoreaderClientTests(unittest.TestCase):
+    def test_html_cleaning_removes_embedded_page_scripts(self):
+        client = InoreaderClient()
+
+        cleaned = client._clean_html(
+            "<p>Example product has a security flaw.</p>"
+            "<script>window.ytcfg.set('EMERGENCY_BASE_URL', '/error');</script>"
+            "<p>Apply the vendor's patch.</p>"
+        )
+
+        self.assertIn("Example product has a security flaw.", cleaned)
+        self.assertIn("Apply the vendor's patch.", cleaned)
+        self.assertNotIn("window.ytcfg", cleaned)
+
+    def test_normalization_keeps_published_time_and_adds_crawl_time_for_scanning(self):
+        client = InoreaderClient(fetch_full_web=False)
+
+        article = client._normalize_item({
+            "id": "article-1",
+            "title": "Example advisory",
+            "published": 100,
+            "timestampUsec": "150000000",
+            "crawlTimeMsec": "175000",
+        })
+
+        self.assertEqual(article["published_timestamp"], 100)
+        self.assertEqual(article["scan_timestamp"], 150)
+
+    def test_normalization_uses_crawl_time_when_microsecond_timestamp_is_missing(self):
+        client = InoreaderClient(fetch_full_web=False)
+
+        article = client._normalize_item({
+            "id": "article-1",
+            "title": "Example advisory",
+            "published": 100,
+            "crawlTimeMsec": "175000",
+        })
+
+        self.assertEqual(article["published_timestamp"], 100)
+        self.assertEqual(article["scan_timestamp"], 175)
+
     def test_missing_authentication_does_not_substitute_sample_articles(self):
         client = InoreaderClient()
 

@@ -5,6 +5,20 @@ import requests
 import urllib3
 from typing import List, Dict, Any, Optional
 
+
+def _timestamp_seconds(value: Any, divisor: int = 1) -> Optional[int]:
+    try:
+        timestamp = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if timestamp <= 0:
+        return None
+    try:
+        return int(timestamp / divisor)
+    except (ValueError, OverflowError):
+        return None
+
+
 class InoreaderClient:
     BASE_URL = "https://www.inoreader.com/reader/api/0"
     LOGIN_URL = "https://www.inoreader.com/accounts/ClientLogin"
@@ -162,9 +176,21 @@ class InoreaderClient:
         """Strips HTML markup and unescapes entities to produce clean searchable plaintext."""
         if not raw_html:
             return ""
-        text = re.sub(r'<(?:br|/p|/div|/h\d|/li)\b[^>]*>', '\n', raw_html, flags=re.IGNORECASE)
+        text = html.unescape(raw_html)
+        text = re.sub(
+            r"<(script|style|noscript|template)\b[^>]*>.*?</\1\s*>",
+            " ",
+            text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        text = re.sub(
+            r"(?im)^.*(?:window\.(?:ytcfg|yterr|unhandledErrorMessages|unhandledErrorCount)\b"
+            r"|function\s*\(\s*\)\s*\{\s*window\.).*$",
+            "",
+            text,
+        )
+        text = re.sub(r'<(?:br|/p|/div|/h\d|/li)\b[^>]*>', '\n', text, flags=re.IGNORECASE)
         text = re.sub(r'<[^>]+>', ' ', text)
-        text = html.unescape(text)
         text = re.sub(r'[ \t]+', ' ', text)
         text = re.sub(r'\n\s*\n', '\n', text)
         return text.strip()
@@ -265,7 +291,12 @@ class InoreaderClient:
                 else:
                     full_text = web_text
 
-        published_ts = item.get("published", int(time.time()))
+        published_ts = _timestamp_seconds(item.get("published")) or int(time.time())
+        scan_ts = (
+            _timestamp_seconds(item.get("timestampUsec"), 1_000_000)
+            or _timestamp_seconds(item.get("crawlTimeMsec"), 1_000)
+            or published_ts
+        )
 
         return {
             "id": item.get("id", f"item_{int(time.time()*1000)}"),
@@ -274,6 +305,7 @@ class InoreaderClient:
             "link": link,
             "content": full_text,
             "published_timestamp": published_ts,
+            "scan_timestamp": scan_ts,
             "_full_page_fetched": full_page_fetched
         }
 
