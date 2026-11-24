@@ -1,5 +1,5 @@
 from pathlib import Path
-from datetime import datetime
+from datetime import date, datetime
 from copy import copy
 from concurrent.futures import ThreadPoolExecutor
 import html
@@ -20,6 +20,26 @@ from zipfile import BadZipFile
 
 from relevance_model import AdvisoryRelevanceModel
 
+PAGE_SCRIPT_NOISE = re.compile(
+    r"\bwindow\.(?:ytcfg|yterr|unhandledErrorMessages|unhandledErrorCount)\b"
+    r"|function\s*\(\s*\)\s*\{\s*window\.",
+    re.IGNORECASE,
+)
+
+REPORT_IMPACT_CLAIMS = (
+    re.compile(
+        r"\b(?:remote code execution|\brce\b|arbitrary (?:code|command) execution|"
+        r"execute arbitrary code)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\b(?:denial.of.service|\bdos\b)\b", re.IGNORECASE),
+    re.compile(r"\bprivilege escalation\b", re.IGNORECASE),
+    re.compile(r"\b(?:authentication|authorization) bypass\b", re.IGNORECASE),
+    re.compile(r"\b(?:sql|command|code) injection\b", re.IGNORECASE),
+    re.compile(r"\binformation disclosure\b", re.IGNORECASE),
+)
+
+
 class AdvisoryExcelExporter:
     RECOMMENDATION_FALLBACK = (
         "No remediation guidance was identified in the advisory or Tenable data. "
@@ -29,8 +49,17 @@ class AdvisoryExcelExporter:
     REVIEW_COLUMNS = ("Review Decision", "Model Suggestion", "Relevance Score")
     STORAGE_COLUMNS = (
         "Article ID",
+        "Advisory ID",
+        "Detailed Report Path",
+        "Member Article IDs",
+        "Duplicate Candidate IDs",
+        "Summary Conflicts",
+        "Delivery Status",
+        "Update Summary",
+        "Content Hash",
         "Initial Triage",
         "Triage Note",
+        "Source References",
         "Recommendation",
         "Affected Products",
         "Affected Versions",
@@ -118,8 +147,11 @@ class AdvisoryExcelExporter:
         ("Source Name", 24, "left"),
         ("Advisory Type", 16, "center"),
         ("Advisory Heading", 42, "left"),
-        ("Link of Advisory", 18, "center"),
+        ("Link of Advisory", 48, "left"),
         ("View Report", 16, "center"),
+        ("View Detailed Report", 20, "center"),
+        ("Other Sources", 48, "left"),
+        ("Duplicate Check", 48, "left"),
         ("Severity", 14, "center"),
         ("CVSS", 10, "center"),
         ("Published Date & Time", 20, "center"),
@@ -169,6 +201,14 @@ class AdvisoryExcelExporter:
         finally:
             if temp_path and temp_path.exists():
                 temp_path.unlink()
+
+    @staticmethod
+    def _recorded_on_date(value, target_date: date) -> bool:
+        if isinstance(value, datetime):
+            return value.date() == target_date
+        if isinstance(value, date):
+            return value == target_date
+        return str(value or "").strip()[:10] == target_date.isoformat()
 
     def _load_existing_workbook(self, path: Path):
         try:
@@ -288,6 +328,8 @@ class AdvisoryExcelExporter:
 
     def _affected_products_text(self, record: Dict[str, Any]) -> str:
         products = str(record.get("affected_products") or "").strip()
+        if PAGE_SCRIPT_NOISE.search(products):
+            products = ""
         products = re.sub(
             r"\s*[:;,-]?\s*(?:see|check|consult)\s+(?:the\s+)?"
             r"(?:vendor\s+)?(?:advisory|bulletin)"
@@ -807,6 +849,54 @@ class AdvisoryExcelExporter:
             for row_idx in range(2, ws.max_row + 1):
                 self._write_report_link(ws, row_idx, None, {"View Report": report_column})
 
+        columns = {
+            str(cell.value).strip(): cell.column
+            for cell in ws[1]
+            if cell.value is not None
+        }
+        if "View Report" in columns and "View Detailed Report" not in columns:
+            detailed_column = columns["View Report"] + 1
+            ws.insert_cols(detailed_column, 1)
+            header = ws.cell(
+                row=1,
+                column=detailed_column,
+                value="View Detailed Report",
+            )
+            header.font = self.HEADER_FONT
+            header.fill = self.HEADER_FILL
+            header.alignment = Alignment(
+                horizontal="center",
+                vertical="center",
+                wrap_text=True,
+            )
+            ws.column_dimensions[get_column_letter(detailed_column)].width = 20
+            for row_idx in range(2, ws.max_row + 1):
+                self._write_detailed_report_link(
+                    ws,
+                    row_idx,
+                    None,
+                    {"View Detailed Report": detailed_column},
+                )
+            columns = {
+                str(cell.value).strip(): cell.column
+                for cell in ws[1]
+                if cell.value is not None
+            }
+        for header, width, _alignment in self.COLUMNS:
+            if header in columns:
+                continue
+            column = ws.max_column + 1
+            cell = ws.cell(row=1, column=column, value=header)
+            cell.font = self.HEADER_FONT
+            cell.fill = self.HEADER_FILL
+            cell.alignment = Alignment(
+                horizontal="center",
+                vertical="center",
+                wrap_text=True,
+            )
+            ws.column_dimensions[get_column_letter(column)].width = width
+            columns[header] = column
+
     def _ensure_review_columns(self, ws):
         columns = {
             str(cell.value).strip(): cell.column
@@ -833,6 +923,7 @@ class AdvisoryExcelExporter:
                 and validation.formula1 in {
                     review_choices,
                     '"☐ Pending,☑ Selected,☒ Rejected,Previously Reported"',
+                    '"Same Event,Keep Separate"',
                 }
             )
         ]
@@ -883,6 +974,22 @@ class AdvisoryExcelExporter:
             f"{get_column_letter(decision_column)}2:"
             f"{get_column_letter(decision_column)}{max(ws.max_row, 5000)}"
         )
+        duplicate_column = columns.get("Duplicate Check")
+        if duplicate_column:
+            duplicate_validation = DataValidation(
+                type="list",
+                formula1='"Same Event,Keep Separate"',
+                allow_blank=True,
+            )
+            duplicate_validation.prompt = (
+                "Choose Same Event or Keep Separate to remember a duplicate decision."
+            )
+            duplicate_validation.promptTitle = "Duplicate decision"
+            ws.add_data_validation(duplicate_validation)
+            duplicate_validation.add(
+                f"{get_column_letter(duplicate_column)}2:"
+                f"{get_column_letter(duplicate_column)}{max(ws.max_row, 5000)}"
+            )
 
         for header in self.REVIEW_COLUMNS:
             column = columns[header]
@@ -900,7 +1007,10 @@ class AdvisoryExcelExporter:
         for header in self.STORAGE_COLUMNS:
             ws.column_dimensions[get_column_letter(columns[header])].hidden = True
         for header, column in columns.items():
-            if header.startswith("CVE Metrics JSON Part "):
+            if (
+                header.startswith("CVE Metrics JSON Part ")
+                or header.startswith("Source References Part ")
+            ):
                 ws.column_dimensions[get_column_letter(column)].hidden = True
         return columns
 
@@ -925,6 +1035,8 @@ class AdvisoryExcelExporter:
             decision = "☑ Selected"
         elif normalized_decision == "Rejected":
             decision = "☒ Rejected"
+        elif normalized_decision == "Previously Reported":
+            decision = "Previously Reported"
         else:
             decision = "☐ Pending"
         metrics_json = json.dumps(
@@ -939,12 +1051,30 @@ class AdvisoryExcelExporter:
             f"CVE Metrics JSON Part {index + 2}"
             for index in range(len(metric_chunks) - 1)
         ]
+        references_json = json.dumps(
+            adv.get("source_references") or [],
+            ensure_ascii=True,
+            separators=(",", ":"),
+        )
+        reference_chunks = [
+            references_json[index:index + self.EXCEL_CELL_TEXT_LIMIT]
+            for index in range(0, len(references_json), self.EXCEL_CELL_TEXT_LIMIT)
+        ] or ["[]"]
+        reference_headers = ["Source References"] + [
+            f"Source References Part {index + 2}"
+            for index in range(len(reference_chunks) - 1)
+        ]
         existing_metric_parts = {
             header: column
             for header, column in columns.items()
             if header.startswith("CVE Metrics JSON Part ")
         }
-        for header in metrics_headers:
+        existing_reference_parts = {
+            header: column
+            for header, column in columns.items()
+            if header.startswith("Source References Part ")
+        }
+        for header in metrics_headers + reference_headers:
             if header not in columns:
                 column = ws.max_column + 1
                 header_cell = ws.cell(row=1, column=column, value=header)
@@ -962,6 +1092,27 @@ class AdvisoryExcelExporter:
             "Model Suggestion": adv.get("model_suggestion", "Collecting labels"),
             "Relevance Score": adv.get("relevance_score", ""),
             "Article ID": adv.get("id", ""),
+            "Advisory ID": adv.get("advisory_id", ""),
+            "Detailed Report Path": adv.get("detailed_report_path", ""),
+            "Member Article IDs": json.dumps(
+                adv.get("member_article_ids")
+                or [adv.get("id")] + list(adv.get("_deduplicated_article_ids") or []),
+                ensure_ascii=True,
+                separators=(",", ":"),
+            ),
+            "Duplicate Candidate IDs": json.dumps(
+                adv.get("duplicate_candidate_ids") or [],
+                ensure_ascii=True,
+                separators=(",", ":"),
+            ),
+            "Summary Conflicts": json.dumps(
+                adv.get("summary_conflicts") or [],
+                ensure_ascii=True,
+                separators=(",", ":"),
+            ),
+            "Delivery Status": adv.get("delivery_status", ""),
+            "Update Summary": adv.get("update_summary", ""),
+            "Content Hash": adv.get("content_hash", ""),
             "Initial Triage": adv.get("initial_triage", "Accepted"),
             "Triage Note": adv.get("triage_note", ""),
             "Recommendation": adv.get("recommendation", ""),
@@ -975,8 +1126,14 @@ class AdvisoryExcelExporter:
             header: metric_chunks[index]
             for index, header in enumerate(metrics_headers)
         })
+        values.update({
+            header: reference_chunks[index]
+            for index, header in enumerate(reference_headers)
+        })
         for header in existing_metric_parts.keys() - set(metrics_headers):
             ws.cell(row=row_idx, column=existing_metric_parts[header], value=None)
+        for header in existing_reference_parts.keys() - set(reference_headers):
+            ws.cell(row=row_idx, column=existing_reference_parts[header], value=None)
         for header, value in values.items():
             column = columns.get(header)
             if column:
@@ -1050,7 +1207,62 @@ class AdvisoryExcelExporter:
         for advisory in advisories:
             self._set_relevance_suggestion(model, advisory)
 
-    def _write_advisory_row(self, ws, row_idx: int, adv: Dict[str, Any], is_master: bool = False):
+    @staticmethod
+    def _other_sources_display(adv: Dict[str, Any]) -> str:
+        references = adv.get("source_references")
+        if not isinstance(references, list):
+            return ""
+        primary_link = str(adv.get("link") or "").strip().casefold()
+        others = list(references)
+        if primary_link:
+            primary_index = next(
+                (
+                    index
+                    for index, reference in enumerate(others)
+                    if isinstance(reference, dict)
+                    and str(reference.get("link") or "").strip().casefold() == primary_link
+                ),
+                None,
+            )
+            if primary_index is not None:
+                others.pop(primary_index)
+        elif len(others) > 1:
+            others = others[1:]
+        other_sources = []
+        for reference in others:
+            if not isinstance(reference, dict):
+                continue
+            source_name = str(reference.get("source_name") or "Source").strip()
+            link = str(reference.get("link") or "").strip()
+            title = str(reference.get("title") or "").strip()
+            detail = f"{source_name}: {link}" if link else source_name
+            if title and title.casefold() != str(adv.get("advisory_heading") or "").casefold():
+                detail = f"{detail} ({title})"
+            if detail not in other_sources:
+                other_sources.append(detail)
+        return "\n".join(other_sources)
+
+    def _advisory_impact_display(self, adv: Dict[str, Any]) -> str:
+        impact = adv.get("impact_summary") or adv.get("summary", "")
+        had_impact = bool(str(impact or "").strip())
+        heading = adv.get("advisory_heading") or adv.get("title", "")
+        source_text = self._clean_page_script_noise(
+            f"{heading}\n{adv.get('source_content') or ''}"
+        )
+        impact = self._sanitize_report_claims(impact, source_text)
+        if had_impact and not impact:
+            return "No technical impact could be verified from the source content."
+        return impact
+
+    def _write_advisory_row(
+        self,
+        ws,
+        row_idx: int,
+        adv: Dict[str, Any],
+        is_master: bool = False,
+        preserve_review_decision: bool = False,
+        preserve_report_link: bool = False,
+    ):
         ws.row_dimensions[row_idx].height = 36
 
         source = adv.get("source_name", "Security Advisory")
@@ -1064,7 +1276,7 @@ class AdvisoryExcelExporter:
         else:
             pub_date_str = str(pub_ts or datetime.now().strftime("%Y-%m-%d %H:%M"))
 
-        impact = adv.get("impact_summary") or adv.get("summary", "")
+        impact = self._advisory_impact_display(adv)
         matched_component = adv.get("matched_app_name", "")
         if adv.get("matched_vendor"):
             matched_component = f"{adv.get('matched_vendor')} - {matched_component}"
@@ -1076,6 +1288,9 @@ class AdvisoryExcelExporter:
             "Advisory Heading": heading,
             "Link of Advisory": "View Advisory" if link.startswith(("http://", "https://")) else "N/A",
             "View Report": "Not generated",
+            "View Detailed Report": "Not generated",
+            "Other Sources": self._other_sources_display(adv),
+            "Duplicate Check": adv.get("duplicate_note", ""),
             "Severity": severity,
             "CVSS": cvss,
             "Published Date & Time": pub_date_str,
@@ -1094,9 +1309,11 @@ class AdvisoryExcelExporter:
         }
         centered_headers = {
             "Link of Advisory", "Severity", "CVSS", "Published Date & Time",
-            "CVE Risk Score", "Attack Vector", "AV Type",
+            "CVE Risk Score", "Attack Vector", "AV Type", "View Detailed Report",
         }
         for header, value in values.items():
+            if header == "View Report" and preserve_report_link:
+                continue
             column = columns.get(header)
             if not column:
                 continue
@@ -1112,19 +1329,44 @@ class AdvisoryExcelExporter:
                 cell.fill = style["fill"]
                 cell.font = style["font"]
         self._write_advisory_link(ws, row_idx, adv, columns)
-        self._write_report_link(ws, row_idx, None, columns)
-        self._write_review_data(ws, row_idx, adv, columns)
+        self._write_detailed_report_link(ws, row_idx, adv, columns)
+        if not preserve_report_link:
+            self._write_report_link(ws, row_idx, None, columns)
+        self._write_review_data(
+            ws,
+            row_idx,
+            adv,
+            columns,
+            preserve_review_decision=preserve_review_decision,
+        )
         self._fit_summary_row(ws, row_idx)
 
     def _write_advisory_link(self, ws, row_idx: int, adv: Dict[str, Any], columns) -> bool:
-        link = str(adv.get("link") or "").strip()
         column = columns.get("Link of Advisory")
-        if not column or not link.startswith(("http://", "https://")):
+        if not column:
             return False
-        cell = ws.cell(row=row_idx, column=column, value="View Advisory")
-        cell.hyperlink = link
+        references = adv.get("source_references")
+        if not isinstance(references, list):
+            references = []
+        primary_link = str(adv.get("link") or "").strip()
+        urls = []
+        if primary_link.startswith(("http://", "https://")):
+            urls.append(primary_link)
+        for reference in references:
+            if not isinstance(reference, dict):
+                continue
+            url = str(reference.get("link") or "").strip()
+            if url.startswith(("http://", "https://")) and url not in urls:
+                urls.append(url)
+        cell = ws.cell(row=row_idx, column=column)
+        cell.hyperlink = None
+        if not urls:
+            cell.value = str(adv.get("link") or "N/A")
+            return False
+        cell.value = "\n".join(urls)
+        cell.hyperlink = urls[0]
         cell.font = Font(name="Calibri", size=10, color="0000EE", underline="single")
-        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
         return True
 
     def _write_report_link(self, ws, row_idx: int, report_ws, columns) -> None:
@@ -1140,6 +1382,31 @@ class AdvisoryExcelExporter:
                 ref=cell.coordinate,
                 location=f"'{escaped_title}'!A1",
             )
+            cell.fill = PatternFill(fill_type="solid", fgColor="1B365D")
+            cell.font = Font(name="Calibri", size=10, bold=True, color="FFFFFF")
+        else:
+            cell.value = "Not generated"
+            cell.fill = PatternFill(fill_type="solid", fgColor="E2E3E5")
+            cell.font = Font(name="Calibri", size=10, color="666666")
+        cell.border = self.THIN_BORDER
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    def _write_detailed_report_link(
+        self,
+        ws,
+        row_idx: int,
+        adv: Optional[Dict[str, Any]],
+        columns,
+    ) -> None:
+        column = columns.get("View Detailed Report")
+        if not column:
+            return
+        cell = ws.cell(row=row_idx, column=column)
+        cell.hyperlink = None
+        report_path = str((adv or {}).get("detailed_report_path") or "").strip()
+        if report_path and Path(report_path).is_file():
+            cell.value = "Open Word Report"
+            cell.hyperlink = Path(report_path).resolve().as_uri()
             cell.fill = PatternFill(fill_type="solid", fgColor="1B365D")
             cell.font = Font(name="Calibri", size=10, bold=True, color="FFFFFF")
         else:
@@ -1355,7 +1622,15 @@ class AdvisoryExcelExporter:
         link = ""
         if link_column:
             link_cell = ws.cell(row=row_idx, column=link_column)
-            link = link_cell.hyperlink.target if link_cell.hyperlink else str(link_cell.value or "")
+            if link_cell.hyperlink:
+                link = link_cell.hyperlink.target
+            else:
+                links = [
+                    line.strip()
+                    for line in str(link_cell.value or "").splitlines()
+                    if line.strip().startswith(("http://", "https://"))
+                ]
+                link = links[0] if links else str(link_cell.value or "")
 
         category = str(value("Advisory Type", "Information")).strip().title()
         if category not in {"Actionable", "Patching", "Information"}:
@@ -1384,6 +1659,42 @@ class AdvisoryExcelExporter:
             )
         if not isinstance(cve_metrics, dict):
             raise ValueError(f"CVE Metrics JSON in summary row {row_idx} must be an object.")
+        reference_columns = sorted(
+            (
+                (0 if header == "Source References" else int(header.rsplit(" ", 1)[1]) - 1, column)
+                for header, column in columns.items()
+                if header == "Source References" or header.startswith("Source References Part ")
+            ),
+            key=lambda item: item[0],
+        )
+        source_references_raw = "".join(
+            str(ws.cell(row=row_idx, column=column).value or "")
+            for _, column in reference_columns
+        ) or "[]"
+        try:
+            source_references = json.loads(source_references_raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Source References JSON in summary row {row_idx} is invalid."
+            ) from exc
+        if not isinstance(source_references, list) or any(
+            not isinstance(reference, dict) for reference in source_references
+        ):
+            raise ValueError(
+                f"Source References JSON in summary row {row_idx} must be a list of objects."
+            )
+
+        def json_list(name: str, default: List[Any]) -> List[Any]:
+            raw = str(value(name, "") or "").strip()
+            if not raw:
+                return default
+            try:
+                parsed = json.loads(raw)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{name} JSON in summary row {row_idx} is invalid.") from exc
+            if not isinstance(parsed, list):
+                raise ValueError(f"{name} JSON in summary row {row_idx} must be a list.")
+            return parsed
 
         return {
             "recorded_date": value("Recorded Date", ""),
@@ -1405,6 +1716,17 @@ class AdvisoryExcelExporter:
             "model_suggestion": value("Model Suggestion", "Collecting labels"),
             "relevance_score": value("Relevance Score", ""),
             "id": value("Article ID", ""),
+            "advisory_id": value("Advisory ID", ""),
+            "detailed_report_path": value("Detailed Report Path", ""),
+            "member_article_ids": json_list(
+                "Member Article IDs",
+                [value("Article ID", "")] if value("Article ID", "") else [],
+            ),
+            "duplicate_candidate_ids": json_list("Duplicate Candidate IDs", []),
+            "summary_conflicts": json_list("Summary Conflicts", []),
+            "delivery_status": value("Delivery Status", ""),
+            "update_summary": value("Update Summary", ""),
+            "content_hash": value("Content Hash", ""),
             "initial_triage": value("Initial Triage", "Accepted"),
             "triage_note": value("Triage Note", ""),
             "recommendation": value("Recommendation", ""),
@@ -1414,6 +1736,8 @@ class AdvisoryExcelExporter:
             "source_content": value("Source Content", ""),
             "cve_metrics": cve_metrics,
             "matched_vendor": value("Matched Vendor", ""),
+            "source_references": source_references,
+            "duplicate_note": value("Duplicate Check", ""),
         }
 
     def _recover_cve_metrics(self, raw: str) -> Dict[str, Any]:
@@ -1447,6 +1771,9 @@ class AdvisoryExcelExporter:
 
     def _infer_threat_classification(self, record: Dict[str, Any]) -> str:
         text = f"{record.get('advisory_heading', '')} {record.get('impact_summary', '')}".lower()
+        trusted_source = self._clean_page_script_noise(
+            f"{record.get('advisory_heading', '')}\n{record.get('source_content') or ''}"
+        )
         classifications = [
             ("Remote Code Execution (RCE)", r"remote code execution|\brce\b"),
             ("Denial-of-Service (DoS)", r"denial.of.service|\bdos\b"),
@@ -1458,9 +1785,14 @@ class AdvisoryExcelExporter:
             ("Ransomware", r"ransomware"),
             ("Malware", r"malware|infostealer|backdoor"),
         ]
-        matches = [label for label, pattern in classifications if re.search(pattern, text)]
+        matches = [
+            label
+            for label, pattern in classifications
+            if re.search(pattern, text) and re.search(pattern, trusted_source, re.IGNORECASE)
+        ]
         classification = " / ".join(matches) if matches else record.get("advisory_type", "Information")
         impact_detail = str(record.get("impact_summary") or "").strip()
+        impact_detail = self._sanitize_report_claims(impact_detail, trusted_source)
         impact_detail = re.sub(r"^\[[^\]]+\]\s*", "", impact_detail)
         if impact_detail and impact_detail.casefold() not in classification.casefold():
             return f"{classification}: {impact_detail}"
@@ -1483,6 +1815,10 @@ class AdvisoryExcelExporter:
             re.IGNORECASE,
         )
 
+        trusted_source = self._clean_page_script_noise(
+            f"{record.get('advisory_heading', '')}\n{record.get('source_content') or ''}"
+        )
+
         def add_sentences(text: Any, require_security_context: bool = True) -> None:
             for sentence in re.split(
                 r"\n+|(?<=[.!?])\s+(?=[A-Za-z])",
@@ -1493,6 +1829,11 @@ class AdvisoryExcelExporter:
                     len(value) < 25
                     or value.casefold() in seen
                     or generic_guidance.search(value)
+                    or PAGE_SCRIPT_NOISE.search(value)
+                    or any(
+                        pattern.search(value) and not pattern.search(trusted_source)
+                        for pattern in REPORT_IMPACT_CLAIMS
+                    )
                     or (
                         require_security_context
                         and not summary_cues.search(value)
@@ -1558,6 +1899,37 @@ class AdvisoryExcelExporter:
         if len(words) > 500:
             summary = " ".join(words[:500]).rstrip(" \t\r\n,.;:-") + "."
         return summary
+
+    @staticmethod
+    def _clean_page_script_noise(text: Any) -> str:
+        value = str(text or "")
+        value = re.sub(
+            r"<(script|style|noscript|template)\b[^>]*>.*?</\1\s*>",
+            " ",
+            value,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        return re.sub(
+            r"(?im)^.*(?:window\.(?:ytcfg|yterr|unhandledErrorMessages|unhandledErrorCount)\b"
+            r"|function\s*\(\s*\)\s*\{\s*window\.).*$",
+            "",
+            value,
+        ).strip()
+
+    @staticmethod
+    def _sanitize_report_claims(text: Any, trusted_source: str) -> str:
+        sentences = []
+        for sentence in re.split(r"\n+|(?<=[.!?])\s+", str(text or "")):
+            sentence = sentence.strip()
+            if not sentence or PAGE_SCRIPT_NOISE.search(sentence):
+                continue
+            if any(
+                pattern.search(sentence) and not pattern.search(trusted_source)
+                for pattern in REPORT_IMPACT_CLAIMS
+            ):
+                continue
+            sentences.append(sentence)
+        return "\n".join(sentences)
 
     def _format_as_bullets(self, text: Any, max_points: Optional[int] = 12) -> str:
         normalized = re.sub(r"[ \t]+", " ", str(text or "")).strip()
@@ -2062,6 +2434,7 @@ class AdvisoryExcelExporter:
         generate_documents: bool = False,
         replace_existing: bool = False,
         informational_only: bool = False,
+        preserve_review_decisions: bool = True,
     ) -> str:
         daily_file = Path(output_path)
         wb = openpyxl.Workbook()
@@ -2164,13 +2537,13 @@ class AdvisoryExcelExporter:
             if heading_key in existing_keys or (article_id and id_key in existing_rows):
                 row_idx = existing_rows.get(heading_key) or existing_rows.get(id_key)
                 if row_idx:
-                    self._write_advisory_link(ws, row_idx, adv, summary_columns)
-                    self._write_review_data(
+                    self._write_advisory_row(
                         ws,
                         row_idx,
                         adv,
-                        summary_columns,
-                        preserve_review_decision=True,
+                        is_master=False,
+                        preserve_review_decision=preserve_review_decisions,
+                        preserve_report_link=True,
                     )
                     existing_rows[heading_key] = row_idx
                 continue
@@ -2202,6 +2575,8 @@ class AdvisoryExcelExporter:
         generate_documents: bool = False,
         update_learning_tracker: bool = False,
         preserve_review_decisions: bool = True,
+        replace_existing: bool = False,
+        replace_recorded_date: Optional[date] = None,
     ) -> str:
         master_file = Path(master_path)
         master_columns = ["Recorded Date"] + [col[0] for col in self.COLUMNS]
@@ -2220,6 +2595,26 @@ class AdvisoryExcelExporter:
                 ws.title = "Summary"
                 self._render_headers(ws, master_columns)
 
+        if replace_recorded_date:
+            for sheet_name in ("Summary", "Informational"):
+                if sheet_name not in wb.sheetnames:
+                    continue
+                dated_ws = wb[sheet_name]
+                headers = {
+                    str(cell.value).strip(): cell.column
+                    for cell in dated_ws[1]
+                    if cell.value is not None
+                }
+                recorded_date_column = headers.get("Recorded Date")
+                if not recorded_date_column:
+                    continue
+                for row_idx in range(dated_ws.max_row, 1, -1):
+                    if self._recorded_on_date(
+                        dated_ws.cell(row_idx, recorded_date_column).value,
+                        replace_recorded_date,
+                    ):
+                        dated_ws.delete_rows(row_idx, 1)
+
         informational = [
             adv for adv in advisories
             if str(adv.get("advisory_type", "")).strip().title() == "Information"
@@ -2231,20 +2626,62 @@ class AdvisoryExcelExporter:
 
         if informational:
             if "Informational" in wb.sheetnames:
-                wb.remove(wb["Informational"])
-            info_ws = wb.create_sheet("Informational")
-            info_columns = ["Recorded Date"] + [col[0] for col in self.COLUMNS]
-            self._render_headers(info_ws, info_columns)
+                info_ws = wb["Informational"]
+                self._ensure_summary_schema(info_ws)
+            else:
+                info_ws = wb.create_sheet("Informational")
+                info_columns = ["Recorded Date"] + [col[0] for col in self.COLUMNS]
+                self._render_headers(info_ws, info_columns)
             info_columns = self._ensure_review_columns(info_ws)
-            for adv_index, adv in enumerate(informational, start=2):
+            existing_info_rows = {}
+            heading_column = info_columns.get("Advisory Heading")
+            article_id_column = info_columns.get("Article ID")
+            for row_idx in range(2, info_ws.max_row + 1):
+                heading_key = str(
+                    info_ws.cell(row_idx, heading_column).value or ""
+                ).strip().casefold() if heading_column else ""
+                article_id = str(
+                    info_ws.cell(row_idx, article_id_column).value or ""
+                ).strip() if article_id_column else ""
+                if heading_key:
+                    existing_info_rows[heading_key] = row_idx
+                if article_id:
+                    existing_info_rows[f"id:{article_id}"] = row_idx
+            start_info_row = info_ws.max_row + 1 if info_ws.max_row > 1 else 2
+            added_info_count = 0
+            for adv in informational:
+                heading_key = str(
+                    adv.get("advisory_heading") or adv.get("title", "")
+                ).strip().casefold()
+                article_id = str(adv.get("id") or "").strip()
+                row_idx = existing_info_rows.get(heading_key)
+                if not row_idx and article_id:
+                    row_idx = existing_info_rows.get(f"id:{article_id}")
+                if row_idx:
+                    self._write_advisory_row(info_ws, row_idx, adv, is_master=True)
+                else:
+                    row_idx = start_info_row + added_info_count
+                    recorded_date = adv.get("recorded_date") or datetime.now().strftime(
+                        "%Y-%m-%d %H:%M"
+                    )
+                    info_ws.cell(row=row_idx, column=1, value=recorded_date)
+                    self._write_advisory_row(info_ws, row_idx, adv, is_master=True)
+                    added_info_count += 1
+                existing_info_rows[heading_key] = row_idx
+                if article_id:
+                    existing_info_rows[f"id:{article_id}"] = row_idx
                 recorded_date = adv.get("recorded_date") or datetime.now().strftime("%Y-%m-%d %H:%M")
-                info_ws.cell(row=adv_index, column=1, value=recorded_date)
-                self._write_advisory_row(info_ws, adv_index, adv, is_master=True)
-                self._write_review_data(info_ws, adv_index, adv, info_columns)
+                if not info_ws.cell(row_idx, 1).value:
+                    info_ws.cell(row=row_idx, column=1, value=recorded_date)
+                self._write_review_data(
+                    info_ws,
+                    row_idx,
+                    adv,
+                    info_columns,
+                    preserve_review_decision=preserve_review_decisions,
+                )
             self._auto_fit_columns(info_ws)
             info_ws.freeze_panes = "B2"
-        elif "Informational" in wb.sheetnames:
-            wb.remove(wb["Informational"])
 
         self._ensure_summary_schema(ws)
         columns = self._ensure_review_columns(ws)
@@ -2277,13 +2714,13 @@ class AdvisoryExcelExporter:
             if heading_key in existing_keys or (article_id and id_key in existing_rows):
                 row_idx = existing_rows.get(heading_key) or existing_rows.get(id_key)
                 if row_idx:
-                    self._write_advisory_link(ws, row_idx, adv, columns)
-                    self._write_review_data(
+                    self._write_advisory_row(
                         ws,
                         row_idx,
                         adv,
-                        columns,
+                        is_master=True,
                         preserve_review_decision=preserve_review_decisions,
+                        preserve_report_link=True,
                     )
                     existing_rows[heading_key] = row_idx
                 continue
@@ -2307,7 +2744,11 @@ class AdvisoryExcelExporter:
         )
         self._auto_fit_columns(ws)
         ws.freeze_panes = "B2"
-        saved_file = self._safe_save(wb, master_file)
+        saved_file = self._safe_save(
+            wb,
+            master_file,
+            replace_existing=replace_existing,
+        )
         return saved_file
 
     def read_summary_records(self, workbook_path: str) -> List[Dict[str, Any]]:
@@ -2332,8 +2773,11 @@ class AdvisoryExcelExporter:
         fixed_widths = {
             "Source Name": 24,
             "Advisory Heading": 42,
-            "Link of Advisory": 16,
+            "Link of Advisory": 48,
             "View Report": 16,
+            "View Detailed Report": 20,
+            "Other Sources": 48,
+            "Duplicate Check": 48,
             "Severity": 14,
             "CVSS": 10,
             "Published Date & Time": 20,

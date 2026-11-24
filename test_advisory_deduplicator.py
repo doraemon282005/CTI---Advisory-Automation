@@ -1,6 +1,7 @@
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import Mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
@@ -564,6 +565,247 @@ class AdvisoryDeduplicatorTests(unittest.TestCase):
         self.assertEqual(
             [record.get("duplicate_note", "") for record in deduplicated],
             ["", ""],
+        )
+
+    def test_reworded_campaign_without_cve_uses_entity_candidate_and_llm(self):
+        source_a = self._record(
+            "article-a",
+            "Source A",
+            "https://a.example/campaign",
+            advisory_heading="APT28 targets Acme Health in credential theft campaign",
+            cve_details="NA",
+            matched_app_name="",
+            affected_products="",
+            affected_versions="",
+            impact_summary=(
+                "APT28 operators accessed the Acme Health patient portal through "
+                "credential theft and exfiltrated medical records."
+            ),
+            report_summary=(
+                "The intrusion used stolen credentials to compromise Acme Health "
+                "and extract patient records."
+            ),
+            source_content=(
+                "APT28 accessed Acme Health patient systems with stolen credentials. "
+                "The operators exfiltrated medical records."
+            ),
+        )
+        source_b = self._record(
+            "article-b",
+            "Source B",
+            "https://b.example/breach",
+            advisory_heading="Acme Health breach linked to APT28 intrusion",
+            cve_details="NA",
+            matched_app_name="",
+            affected_products="",
+            affected_versions="",
+            impact_summary=(
+                "A campaign attributed to APT28 compromised the Acme Health portal, "
+                "stealing login credentials and taking patient records."
+            ),
+            report_summary=(
+                "The attackers used stolen credentials to access Acme Health and "
+                "remove medical records."
+            ),
+            source_content=(
+                "APT28 compromised Acme Health patient services with stolen credentials "
+                "and removed medical records."
+            ),
+        )
+        adjudicator = Mock(return_value={
+            "same_event": True,
+            "confidence": 0.96,
+            "reason": "Both reports describe the same Acme Health intrusion.",
+            "conflicts": [],
+        })
+
+        deduplicated, _ = AdvisoryDeduplicator().deduplicate(
+            [source_a, source_b],
+            [],
+            adjudicator=adjudicator,
+        )
+
+        self.assertEqual(len(deduplicated), 1)
+        adjudicator.assert_called_once()
+        self.assertEqual(
+            [reference["article_id"] for reference in deduplicated[0]["source_references"]],
+            ["article-a", "article-b"],
+        )
+
+    def test_no_product_name_match_can_be_adjudicated_from_shared_cve(self):
+        source_a = self._record(
+            "article-a",
+            "Source A",
+            "https://a.example/advisory",
+            advisory_heading="Azure Kubernetes Service control-plane flaw CVE-2026-76543",
+            matched_app_name="Azure Kubernetes Service",
+            affected_products="Azure Kubernetes Service",
+        )
+        source_b = self._record(
+            "article-b",
+            "Source B",
+            "https://b.example/advisory",
+            advisory_heading="AKS control plane vulnerability CVE-2026-76543",
+            matched_app_name="AKS",
+            affected_products="AKS",
+            source_content=(
+                "CVE-2026-76543 allows remote code execution in the Kubernetes control "
+                "plane, affecting managed clusters."
+            ),
+            report_summary=(
+                "The Kubernetes control plane is vulnerable to remote code execution "
+                "in managed clusters."
+            ),
+        )
+        adjudicator = Mock(return_value={
+            "same_event": True,
+            "confidence": 0.93,
+            "reason": "The reports describe the same CVE in the same control plane.",
+            "conflicts": [],
+        })
+
+        deduplicated, _ = AdvisoryDeduplicator().deduplicate(
+            [source_a, source_b],
+            [],
+            adjudicator=adjudicator,
+        )
+
+        self.assertEqual(len(deduplicated), 1)
+        adjudicator.assert_called_once()
+
+    def test_conflicting_versions_are_explicit_in_fallback_summary(self):
+        source_a = self._record(
+            "article-a",
+            "Source A",
+            "https://a.example/advisory",
+            affected_versions="2.0.0",
+            severity="HIGH",
+        )
+        source_b = self._record(
+            "article-b",
+            "Source B",
+            "https://b.example/advisory",
+            affected_versions="3.0.0",
+            severity="CRITICAL",
+        )
+        adjudicator = Mock(return_value={
+            "same_event": True,
+            "confidence": 0.98,
+            "reason": "The shared CVE identifies the same underlying issue.",
+            "conflicts": [],
+        })
+
+        deduplicated, _ = AdvisoryDeduplicator().deduplicate(
+            [source_a, source_b],
+            [],
+            adjudicator=adjudicator,
+        )
+
+        self.assertEqual(len(deduplicated), 1)
+        self.assertIn("different affected versions", deduplicated[0]["report_summary"])
+        self.assertIn("different severities", deduplicated[0]["report_summary"])
+        self.assertEqual(len(deduplicated[0]["summary_conflicts"]), 2)
+
+    def test_same_cve_different_lifecycle_stages_remains_separate(self):
+        disclosure = self._record(
+            "article-disclosure",
+            "Source A",
+            "https://a.example/disclosure",
+            advisory_heading="Apache Ignite vulnerability disclosed CVE-2026-12345",
+            impact_summary="A vulnerability in Apache Ignite was disclosed.",
+            report_summary="Researchers disclosed the flaw in Apache Ignite.",
+            source_content="The vulnerability was disclosed on 2026-01-01.",
+        )
+        exploitation = self._record(
+            "article-exploitation",
+            "Source B",
+            "https://b.example/exploitation",
+            advisory_heading="Apache Ignite CVE-2026-12345 actively exploited",
+            impact_summary="Attackers are actively exploiting the Apache Ignite flaw.",
+            report_summary="The vulnerability is exploited in the wild.",
+            source_content="The flaw is actively exploited in the wild.",
+        )
+        decision_callback = Mock()
+        adjudicator = Mock(return_value={
+            "same_event": True,
+            "confidence": 0.99,
+            "reason": "Both articles mention the same CVE.",
+            "conflicts": [],
+        })
+
+        deduplicated, _ = AdvisoryDeduplicator().deduplicate(
+            [disclosure, exploitation],
+            [],
+            adjudicator=adjudicator,
+            decision_callback=decision_callback,
+        )
+
+        self.assertEqual(len(deduplicated), 2)
+        self.assertIn("lifecycle stages", deduplicated[1]["duplicate_note"])
+        self.assertTrue(any(
+            call.kwargs.get("same_event") is False
+            for call in decision_callback.call_args_list
+        ))
+
+    def test_previously_decided_different_pair_is_not_reflagged(self):
+        source_a = self._record("article-a", "Source A", "https://a.example/advisory")
+        source_b = self._record("article-b", "Source B", "https://b.example/advisory")
+
+        deduplicated, _ = AdvisoryDeduplicator().deduplicate(
+            [source_b],
+            [source_a],
+            pair_decisions={
+                ("article-a", "article-b"): {
+                    "same_event": False,
+                    "decided_by": "human",
+                    "reason": "Human chose Keep Separate.",
+                },
+            },
+        )
+
+        self.assertEqual(len(deduplicated), 1)
+        self.assertEqual(deduplicated[0].get("duplicate_note", ""), "")
+
+    def test_merge_summary_callback_receives_every_source_record(self):
+        source_a = self._record("article-a", "Source A", "https://a.example/advisory")
+        source_b = self._record(
+            "article-b",
+            "Source B",
+            "https://b.example/advisory",
+            report_summary=(
+                "Attackers can execute arbitrary code in Apache Ignite. "
+                "The issue also exposes stored credentials."
+            ),
+        )
+        generated_summary = {
+            "impact_summary": "The flaw enables remote code execution.",
+            "report_summary": "The issue exposes stored credentials.",
+            "recommendation": "Upgrade to the fixed version.",
+            "affected_products": "Apache Ignite",
+            "affected_versions": "2.0.0",
+            "severity": "HIGH",
+            "cve_details": "CVE-2026-12345",
+            "iocs": "example[.]com",
+            "conflicts": [],
+        }
+        summarizer = Mock(return_value=generated_summary)
+
+        deduplicated, _ = AdvisoryDeduplicator().deduplicate(
+            [source_a, source_b],
+            [],
+            summarizer=summarizer,
+        )
+
+        self.assertEqual(len(deduplicated), 1)
+        summarizer.assert_called_once()
+        summarized_record = summarizer.call_args.args[0]
+        self.assertEqual(
+            [reference["source_name"] for reference in summarized_record["source_references"]],
+            ["Source A", "Source B"],
+        )
+        self.assertEqual(
+            deduplicated[0]["report_summary"],
+            generated_summary["report_summary"],
         )
 
 

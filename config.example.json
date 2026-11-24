@@ -12,13 +12,15 @@
     },
     "gemini": {
         "api_key": "",
-        "model": "gemini-2.5-flash",
+        "model": "gemini-3.5-flash-lite",
+        "requests_per_minute": 12,
         "verify_ssl": true,
         "use_fallback_if_missing": true
     },
     "openai": {
         "api_key": "",
-        "model": "gpt-4o-mini"
+        "model": "gpt-4o-mini",
+        "enabled": false
     },
     "nvd": {
         "api_key": ""
@@ -44,5 +46,10 @@
     "matching": {
         "case_sensitive": false,
         "min_word_length": 3
+    },
+    "deduplication": {
+        "pending_days": 7,
+        "same_event_confidence_threshold": 0.85,
+        "candidate_similarity_threshold": 0.18
     }
 }

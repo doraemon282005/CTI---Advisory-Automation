@@ -9,8 +9,9 @@ C:\Users\PwC\Desktop\Advisory API\Codebase
 Install Python 3 (the Windows Python launcher "py" should be available), then install
 the project's third-party packages:
 
-    py -3 -m pip install --upgrade pip
-    py -3 -m pip install requests urllib3 openpyxl
+    py -3 -m venv .venv
+    .\.venv\Scripts\python.exe -m pip install --upgrade pip
+    .\.venv\Scripts\python.exe -m pip install requests urllib3 openpyxl python-docx
 
 The project reads its Inoreader and AI settings from config.json. Optional NVD and
 Tenable credentials can be set for your Windows user; replace the placeholders locally:
@@ -31,18 +32,20 @@ Run the normal daily scan:
 
 Equivalent direct commands:
 
-    py -3 "src\pipeline.py"
-    py -3 "src\pipeline.py" --hours 48
-    py -3 "src\pipeline.py" --force
+    .\.venv\Scripts\python.exe -u "src\pipeline.py"
+    .\.venv\Scripts\python.exe -u "src\pipeline.py" --hours 48
+    .\.venv\Scripts\python.exe -u "src\pipeline.py" --force
 
 Rebuild existing reports without fetching new feed items:
 
-    py -3 "src\pipeline.py" --refresh-reports
+    .\.venv\Scripts\python.exe -u "src\pipeline.py" --refresh-reports
 
 After reviewing the daily workbook, generate selected report sheets and update the
-category master workbooks:
+category master workbooks. This also creates eligible Word reports in the date
+folder's `Detailed Advisory Reports` subfolder and adds their links to the
+daily and master Summary sheets:
 
-    py -3 "src\pipeline.py" --process-reviewed
+    .\.venv\Scripts\python.exe -u "src\pipeline.py" --process-reviewed
 
 The three daily category workbooks are saved together under:
 

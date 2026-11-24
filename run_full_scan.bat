@@ -5,7 +5,13 @@ setlocal EnableDelayedExpansion
 cd /d "%~dp0"
 
 echo [CTI Advisory Surveillance] Running FULL SCAN (re-evaluating all articles from feed)...
-py -3 "src\pipeline.py" --force
+if exist ".venv\Scripts\python.exe" (
+    ".venv\Scripts\python.exe" -u "src\pipeline.py" --force
+) else if exist "venv\Scripts\python.exe" (
+    "venv\Scripts\python.exe" -u "src\pipeline.py" --force
+) else (
+    py -3 -u "src\pipeline.py" --force
+)
 set "EXIT_CODE=%ERRORLEVEL%"
 
 if not "!EXIT_CODE!"=="0" (

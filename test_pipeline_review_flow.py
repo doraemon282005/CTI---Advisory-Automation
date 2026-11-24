@@ -1,7 +1,9 @@
 import sys
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
+from unittest.mock import patch
 
 import openpyxl
 
@@ -24,6 +26,7 @@ class ReviewFlowTests(unittest.TestCase):
                 self.events = []
                 self.master_records = None
                 self.master_options = None
+                self.daily_options = None
 
             def read_summary_records(self, path):
                 self.events.append(("read", Path(path).name))
@@ -31,6 +34,7 @@ class ReviewFlowTests(unittest.TestCase):
 
             def export_daily(self, path, records, **kwargs):
                 self.events.append(("daily", kwargs))
+                self.daily_options = kwargs
                 return path
 
             def append_to_master(self, path, records, **kwargs):
@@ -45,16 +49,28 @@ class ReviewFlowTests(unittest.TestCase):
             master_path = Path(temp_dir) / "master.xlsx"
             exporter = Exporter()
 
-            saved_daily, saved_master, selected_count, report_count = (
-                process_reviewed_advisories(exporter, daily_path, master_path)
-            )
+            with patch(
+                "pipeline._close_excel_workbook_if_open",
+                side_effect=lambda path: exporter.events.append(("close", path)),
+            ):
+                saved_daily, saved_master, selected_count, report_count = (
+                    process_reviewed_advisories(exporter, daily_path, master_path)
+                )
 
         self.assertEqual([event[0] for event in exporter.events], [
-            "read", "daily", "read", "master",
+            "close", "close", "read", "daily", "read", "master",
         ])
+        self.assertEqual(exporter.events[0][1], daily_path)
+        self.assertEqual(exporter.events[1][1], master_path)
+        self.assertTrue(exporter.daily_options["replace_existing"])
         self.assertEqual(exporter.master_records[0]["review_decision"], "☑ Selected")
         self.assertTrue(exporter.master_options["generate_documents"])
         self.assertFalse(exporter.master_options["preserve_review_decisions"])
+        self.assertTrue(exporter.master_options["replace_existing"])
+        self.assertEqual(
+            exporter.master_options["replace_recorded_date"],
+            datetime.now().date(),
+        )
         self.assertEqual((selected_count, report_count), (1, 1))
         self.assertEqual(saved_daily, str(daily_path))
         self.assertEqual(saved_master, str(master_path))

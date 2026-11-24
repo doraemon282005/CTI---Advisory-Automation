@@ -30,9 +30,15 @@ class Config:
             },
             "gemini": {
                 "api_key": "",
-                "model": "gemini-2.5-flash",
+                "model": "gemini-3.5-flash-lite",
+                "requests_per_minute": 12,
                 "verify_ssl": False,
                 "use_fallback_if_missing": True
+            },
+            "openai": {
+                "api_key": "",
+                "model": "gpt-4o-mini",
+                "enabled": False
             },
             "nvd": {
                 "api_key": ""
@@ -57,6 +63,11 @@ class Config:
             "matching": {
                 "case_sensitive": False,
                 "min_word_length": 3
+            },
+            "deduplication": {
+                "pending_days": 7,
+                "same_event_confidence_threshold": 0.85,
+                "candidate_similarity_threshold": 0.18,
             }
         }
 

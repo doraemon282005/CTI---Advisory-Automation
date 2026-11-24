@@ -5,7 +5,13 @@ setlocal EnableDelayedExpansion
 cd /d "%~dp0"
 
 echo [CTI Advisory Surveillance] Starting daily cycle...
-py -3 "src\pipeline.py"
+if exist ".venv\Scripts\python.exe" (
+    ".venv\Scripts\python.exe" -u "src\pipeline.py"
+) else if exist "venv\Scripts\python.exe" (
+    "venv\Scripts\python.exe" -u "src\pipeline.py"
+) else (
+    py -3 -u "src\pipeline.py"
+)
 set "EXIT_CODE=%ERRORLEVEL%"
 
 if not "!EXIT_CODE!"=="0" (

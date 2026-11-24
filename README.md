@@ -8,7 +8,7 @@ An automated end-to-end vulnerability surveillance system for infrastructure and
 
 Filtering has two levels. First, an advisory must match an application in the configured Application Inventory. Related-story and footer text is excluded from that match and from company routing. Only those inventory-matched advisories are then routed to exactly one category: **Telecom** if the advisory also contains a telecom-list company name; otherwise **Vendor** if it contains a vendor-list name; otherwise **Miscellaneous**. The order prevents an advisory from being duplicated across category workbooks and prevents telecom/vendor names alone from admitting unrelated advisories. Ambiguous common one-word company names are matched only when written in their listed all-caps form; short names require nearby telecom context.
 
-The daily run creates or rebuilds three category workbooks and one separate informational workbook. Information advisories are excluded from the Telecom, Vendor, and Miscellaneous workbooks. Each workbook is created with Summary headers even when it has no records. If a same-day workbook exists, it is rebuilt from the full scan window and its review decisions are discarded, as in the previous workflow.
+The daily run creates or rebuilds three category workbooks and one separate informational workbook. Information advisories are excluded from the Telecom, Vendor, and Miscellaneous workbooks. Each workbook is created with Summary headers even when it has no records. If a same-day workbook exists, its unreviewed rows and decisions are retained while the full scan window is refreshed.
 
 1. **Telecom**: `reports/daily/YYYY-MM-DD/Daily_Telecom_Advisories_YYYY-MM-DD.xlsx`; archive: `reports/Master_Telecom_Advisories.xlsx`. Names come from `Global Telecom List.xlsx`.
 2. **Vendor**: `reports/daily/YYYY-MM-DD/Daily_Vendor_Advisories_YYYY-MM-DD.xlsx`; archive: `reports/Master_Vendor_Advisories.xlsx`. Names come from `Vendor List.xlsx`.
@@ -16,25 +16,36 @@ The daily run creates or rebuilds three category workbooks and one separate info
 4. **Informational**: `reports/daily/YYYY-MM-DD/Daily_Informational_Advisories_YYYY-MM-DD.xlsx`. This contains all advisories classified as `Information`, regardless of their Telecom/Vendor/Miscellaneous route. It is a standalone daily workbook and is not included in category master archives.
 
 All four daily workbooks are grouped in one `reports/daily/YYYY-MM-DD/` folder for the report date.
+Running `--process-reviewed` also creates eligible Word reports in that date folder's `Detailed Advisory Reports/` subfolder. The daily and category master Summary sheets contain a **View Detailed Report** link beside **View Report**. Reports use `Detailed Advisory Report Format.docx`; incomplete or unstructured fields are left blank rather than presented as facts.
 
-Each daily Summary stages candidates as `Selected` by default; review each category workbook before running `--process-reviewed`. The original `Master_Advisories.xlsx` is retained unchanged as a legacy backup. Its historical Summary records are copied into the three category archives.
+Each daily Summary stages candidates as `Selected` by default; review each category workbook before running `--process-reviewed`. Unreviewed category advisories from the last seven days remain eligible for cross-source matching and are carried forward when a same-day workbook is rebuilt. The original `Master_Advisories.xlsx` is retained unchanged as a legacy backup. Its historical Summary records are copied into the three category archives.
 
 The default Inoreader window is the previous local calendar day, from midnight inclusive to today's midnight exclusive, regardless of report-generation time. Window eligibility uses Inoreader's crawl timestamp so newly discovered articles are not dropped because a publisher's original publication date is older; the publisher date remains the date shown in reports. The feed is paginated through all available articles in the window; there is no per-run article-count cap. `--hours N` scans the N-hour window ending at today's local midnight.
 
 ### Cross-source duplicate handling
 
-The pipeline compares each candidate with both other candidates in the scan and records already in the category archives. It analyzes the full source article, advisory title, primary CVEs, product identity, vulnerability class, and version details; a shared CVE alone or a broad inventory match is not enough to merge unrelated issues. Without a shared primary CVE, merging requires a strong full-article match plus either the same vulnerability class or distinctive matching title details. High-confidence matches become one advisory even when sources list different additional CVEs; distinct summary and remediation details are combined, and repeated sentences are removed. All source names and links remain in **Other Sources**, including matches found in later runs. Possible but uncertain matches are kept separate, marked **Pending**, and described in **Duplicate Check** for human review.
+The pipeline compares each candidate with other articles in the scan, recent unreviewed daily workbooks, and records in all category archives. It checks CVEs, product identity, versions, vulnerability class, shared named entities (such as actors, malware, and victims), and title/summary similarity. Candidate pairs that are uncertain are adjudicated by the configured Gemini/OpenAI evaluator; if neither API is available, they remain separate and flagged for human review. Different lifecycle stages of one CVE—disclosure, active exploitation, or patch release—are kept separate and cross-referenced.
+
+Gemini requests are paced by `gemini.requests_per_minute` (default `12`) so parallel advisory evaluation and merge checks stay below the Free Tier's 15-requests-per-minute limit. This makes runs slower rather than requiring billing. On an HTTP 429, 404, or network failure, Gemini is disabled for the rest of that run and the pipeline continues with rule-based results and human review; if another process used the free quota, wait for its window to reset before rerunning. `openai.enabled` defaults to `false`, so the pipeline will not make billable OpenAI fallback calls even if an OpenAI key is present. Set it to `true` only if you explicitly want to allow paid OpenAI requests.
+
+Confirmed same-event reports become one advisory. A single merged summary is generated from all source records when an AI API is available; otherwise the existing rule-based summary merge is used. Unique remediation, affected products/versions, CVEs, and IOCs are retained. Source conflicts (including affected versions or severity) are preserved and called out in the summary. Every source URL is shown on its own line in **Link of Advisory**; the first URL is clickable. **Other Sources** lists each additional source and link. Possible matches remain separate and are described in **Duplicate Check**.
+
+For a human duplicate decision, select **Same Event** or **Keep Separate** from the **Duplicate Check** cell. Decisions are stored by article-ID pair so a resolved pair is not repeatedly flagged. Choosing **Keep Separate** on an already merged row splits its stored source records back into separate review items on the next pipeline run. These controls are separate from `Review Decision`, which continues to control advisory relevance.
+
+The cache database keeps a pair-decision table and a send ledger keyed by stable `advisory_id`, recipient team, and content hash. No mail is sent by this stage. If new unique source facts join an advisory that already has a send-ledger entry, the record is marked `UPDATE` and its `Update Summary` contains only the newly added facts. Repeated content hashes are idempotent in the ledger.
 
 Transient Inoreader connection failures are retried up to two times with a short backoff. If the feed still cannot be reached, the run stops with an error rather than substituting sample data; check the network connection and Inoreader availability before retrying.
 
 ### Human-reviewed relevance workflow
 
 1. Run the normal daily command. Candidates appear in the applicable category workbook with `Review Decision` set to `Selected` by default. Change unwanted items to `☒ Rejected` (or `☐ Pending` if they still need review). The master archives are not updated during this step. Candidates flagged by initial AI triage remain visible and are marked `UNASSESSED` instead of being silently dropped.
-2. Review the Summary sheet in each daily workbook and confirm or change `Review Decision`: `☑ Selected`, `☐ Pending`, or `☒ Rejected`. `Model Suggestion` is advisory only.
-3. Run `python "src\pipeline.py" --process-reviewed`. This processes every available category workbook. Detailed report sheets are generated only for items left `Selected` with non-LOW severity. After each daily report is saved successfully, its records are appended to the corresponding category archive. Pending, rejected, and LOW advisories never get detailed sheets.
+2. Review the Summary sheet in each daily workbook and confirm or change `Review Decision`: `☑ Selected`, `☐ Pending`, or `☒ Rejected`. Use `Duplicate Check` only to resolve a possible/merged duplicate. `Model Suggestion` is advisory only.
+3. Run `.\.venv\Scripts\python.exe -u "src\pipeline.py" --process-reviewed`. This processes available category workbooks within the configured pending window. Detailed report sheets are generated for items left `Selected` with non-LOW severity; separate Word reports are generated for selected, non-LOW `Actionable` and `Patching` items. After each daily report is saved successfully, its records are appended to the corresponding category archive. Pending, rejected, previously-reported, and LOW advisories never get detailed reports.
 4. Open the **Learning Tracker** sheet in each category master workbook for its status view. Only human Selected/Rejected decisions count as training labels.
 
-If the daily pipeline is rerun on the same date, that date's existing master rows are ignored during duplicate matching so the fresh scan can rebuild the review workbooks. When `--process-reviewed` saves the new reviewed batch, it replaces that date's rows and report tabs in the master archive while preserving records from earlier dates.
+If the daily pipeline is rerun on the same date, that date's existing master rows are ignored during duplicate matching so the fresh scan can rebuild the review workbooks. Pending rows and their review decisions are retained. When `--process-reviewed` saves a reviewed batch, it replaces that workbook date's rows and report tabs in the master archive while preserving records from earlier dates.
+
+The `deduplication` section in `config.json` controls `pending_days` (default `7`), `same_event_confidence_threshold` (default `0.85`), and `candidate_similarity_threshold` (default `0.18`). The database stores stable advisory IDs, member article IDs, pair decisions, and delivery status fields in hidden workbook columns without changing the existing Summary layout.
 
 The first local learner is an explainable, weighted Naive Bayes baseline using advisory text, matched applications, severity, and advisory type. It retrains from human `Selected` and `Rejected` decisions in the Master Summary on later runs. Suggestions begin only after at least five labels in each class. The Learning Tracker reports cross-validated metrics and recurring terms; these are early indicators, not a guarantee of production accuracy. The model never selects or publishes advisories. Corrected decisions are used on the next run. Advisory format examples are templates, not relevance labels. Detailed report sheets are created only for items left `Selected` after human review. Threat details, summaries, and recommendations are rendered as concise bullet points; the source link remains available for context.
 
@@ -67,10 +78,10 @@ Each summary row includes a **View Report** button after the vendor link. It ope
 | **1** | **Source Name** | E.g., Cisco PSIRT, CISA KEV, Palo Alto, Oracle CPU, NVD, GBHackers, The Hacker News |
 | **2** | **Advisory Type** | `Actionable`, `Patching`, or `Information` |
 | **3** | **Advisory Heading** | Clean technical title including CVE identifiers |
-| **4** | **Link of Advisory** | Clickable blue hyperlink opening directly to the vendor advisory |
+| **4** | **Link of Advisory** | One source URL per line; the first URL is the clickable hyperlink |
 | **5** | **View Report** | Button linking directly to the generated report sheet; displays `Not generated` until a report exists |
 | **6** | **Other Sources** | Additional source names and links consolidated for the same issue |
-| **7** | **Duplicate Check** | Possible duplicate details requiring human comparison; blank when no uncertainty was found |
+| **7** | **Duplicate Check** | Possible duplicate details or the human Same Event / Keep Separate control |
 | **8** | **Severity** | Color-coded badge (`CRITICAL` [Red], `HIGH` [Orange], `MEDIUM` [Yellow], `LOW` [Green]) |
 | **9** | **CVSS** | Extracted CVSS Base Score (e.g., 9.8, 8.6) |
 | **10** | **Published Date & Time** | Original publication timestamp (`YYYY-MM-DD HH:MM`) |
@@ -141,27 +152,32 @@ Open the terminal in VS Code (``Ctrl + ` ``) and execute:
 ```
 or run with Python directly:
 ```powershell
-py -3 "src\pipeline.py"
+.\.venv\Scripts\python.exe -u "src\pipeline.py"
 ```
 
 To scan a different number of hours ending at local midnight:
 ```powershell
-py -3 "src\pipeline.py" --hours 48
+.\.venv\Scripts\python.exe -u "src\pipeline.py" --hours 48
 ```
 
 To force re-processing of already cached items:
 ```powershell
-py -3 "src\pipeline.py" --force
+.\.venv\Scripts\python.exe -u "src\pipeline.py" --force
+```
+
+To evaluate and print duplicate decisions without writing workbooks or cache entries:
+```powershell
+.\.venv\Scripts\python.exe -u "src\pipeline.py" --dry-run-merges
 ```
 
 To rebuild existing daily and master workbooks with the latest CVE metrics and remediation extraction (without fetching the feed):
 ```powershell
-python "src\pipeline.py" --refresh-reports
+.\.venv\Scripts\python.exe -u "src\pipeline.py" --refresh-reports
 ```
 
 After marking decisions in today's Daily Advisories Summary, generate the selected reports and then update the master archive:
 ```powershell
-python "src\pipeline.py" --process-reviewed
+.\.venv\Scripts\python.exe -u "src\pipeline.py" --process-reviewed
 ```
 
 ### 4. Schedule the Daily 5:00 AM Automated Run

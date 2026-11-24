@@ -1,6 +1,8 @@
 import sys
+import json
 import tempfile
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -14,6 +16,81 @@ from ai_evaluator import SecurityAIEvaluator
 
 
 class ReportEnrichmentTests(unittest.TestCase):
+    def test_default_gemini_model_uses_current_stable_flash_lite(self):
+        evaluator = SecurityAIEvaluator()
+
+        self.assertEqual(evaluator.model_name, "gemini-3.5-flash-lite")
+
+    def test_paid_openai_fallback_can_be_disabled_even_when_keys_are_set(self):
+        with patch.dict("os.environ", {"OPENAI_API_KEY": "environment-key"}):
+            evaluator = SecurityAIEvaluator(
+                openai_api_key="configured-key",
+                allow_openai=False,
+            )
+
+        self.assertEqual(evaluator.openai_key, "")
+
+    def test_gemini_requests_are_spaced_for_free_tier_limit(self):
+        evaluator = SecurityAIEvaluator(gemini_requests_per_minute=12)
+
+        with (
+            patch("ai_evaluator.time.monotonic", return_value=0.0),
+            patch.object(evaluator._gemini_disabled_event, "wait", return_value=False) as wait,
+        ):
+            evaluator._wait_for_gemini_slot()
+            evaluator._wait_for_gemini_slot()
+
+        wait.assert_called_once_with(5.0)
+
+    def test_gemini_rate_limit_disables_further_requests_this_run(self):
+        evaluator = SecurityAIEvaluator(api_key="gemini-test-key")
+        response = Mock(status_code=429)
+        response.json.return_value = {
+            "error": {"message": "Free-tier requests per minute limit exceeded."},
+        }
+
+        with patch("ai_evaluator.requests.post", return_value=response) as post:
+            first = evaluator.adjudicate_duplicate_pair(
+                {"id": "article-a"},
+                {"id": "article-b"},
+            )
+            second = evaluator.adjudicate_duplicate_pair(
+                {"id": "article-c"},
+                {"id": "article-d"},
+            )
+
+        self.assertIsNone(first)
+        self.assertIsNone(second)
+        post.assert_called_once()
+        self.assertTrue(evaluator._gemini_disabled)
+
+    def test_gemini_http_error_includes_provider_message_without_request_url(self):
+        evaluator = SecurityAIEvaluator(
+            api_key="gemini-test-key",
+            model_name="gemini-3.5-flash-lite",
+        )
+        response = Mock(status_code=404)
+        response.json.return_value = {
+            "error": {"message": "Model was not found or is not accessible."},
+        }
+
+        with (
+            patch("ai_evaluator.requests.post", return_value=response) as post,
+            self.assertLogs("ai_evaluator", level="WARNING") as captured,
+        ):
+            result = evaluator.adjudicate_duplicate_pair(
+                {"id": "article-a"},
+                {"id": "article-b"},
+            )
+
+        self.assertIsNone(result)
+        self.assertIn("models/gemini-3.5-flash-lite:generateContent", post.call_args.args[0])
+        self.assertTrue(any(
+            "HTTP 404: Model was not found or is not accessible." in message
+            for message in captured.output
+        ))
+        self.assertTrue(all("gemini-test-key" not in message for message in captured.output))
+
     def test_extracts_remediation_and_cve_specific_scores(self):
         exporter = AdvisoryExcelExporter()
         content = (
@@ -75,6 +152,367 @@ class ReportEnrichmentTests(unittest.TestCase):
         limited = evaluator.limit_summary_words(long_summary)
 
         self.assertLessEqual(len(limited.split()), 500)
+
+    def test_generated_summary_drops_script_noise_and_unsupported_impact_claims(self):
+        evaluator = SecurityAIEvaluator(api_key="", openai_api_key="")
+        generated = (
+            "window.ytcfg.set('EMERGENCY_BASE_URL', '/error'); "
+            "function(){window.yterr=true;}\n"
+            "Allows remote attackers to execute arbitrary code on Ignite."
+        )
+
+        cleaned = evaluator._sanitize_generated_security_text(
+            generated,
+            "Ignite is mentioned in this feed item.",
+            "Ignite",
+        )
+
+        self.assertNotIn("window.", cleaned)
+        self.assertNotIn("remote attackers", cleaned)
+        self.assertIn("Security vulnerability identified affecting Ignite.", cleaned)
+
+    def test_duplicate_adjudication_validates_json_and_falls_back_to_openai(self):
+        evaluator = SecurityAIEvaluator(
+            api_key="gemini-test-key",
+            openai_api_key="openai-test-key",
+            allow_openai=True,
+        )
+        gemini_response = Mock(status_code=200)
+        gemini_response.json.return_value = {
+            "candidates": [{
+                "content": {
+                    "parts": [{"text": json.dumps({"unexpected": "shape"})}],
+                },
+            }],
+        }
+        openai_result = {
+            "same_event": True,
+            "confidence": 0.94,
+            "reason": "Both advisories describe the same event.",
+            "conflicts": [],
+        }
+        openai_response = Mock(status_code=200)
+        openai_response.json.return_value = {
+            "choices": [{
+                "message": {"content": json.dumps(openai_result)},
+            }],
+        }
+
+        with patch(
+            "ai_evaluator.requests.post",
+            side_effect=[gemini_response, openai_response],
+        ) as post:
+            result = evaluator.adjudicate_duplicate_pair(
+                {"id": "article-a", "advisory_heading": "Example incident"},
+                {"id": "article-b", "advisory_heading": "Example incident update"},
+            )
+
+        self.assertEqual(result, openai_result)
+        self.assertEqual(post.call_count, 2)
+        self.assertIn("generativelanguage.googleapis.com", post.call_args_list[0].args[0])
+        self.assertEqual(
+            post.call_args_list[1].args[0],
+            "https://api.openai.com/v1/chat/completions",
+        )
+
+    def test_merged_summary_response_is_schema_checked_and_retains_unique_fields(self):
+        evaluator = SecurityAIEvaluator(api_key="", openai_api_key="")
+        summary = {
+            "impact_summary": "The issue permits remote code execution.",
+            "report_summary": "Sources report affected versions 2.x and 3.x.",
+            "recommendation": "Apply the vendor patch.",
+            "affected_products": "Example Platform",
+            "affected_versions": "2.x; 3.x",
+            "severity": "HIGH",
+            "cve_details": "CVE-2026-12345",
+            "iocs": "example[.]com",
+            "conflicts": ["Sources disagree on affected versions."],
+        }
+        with patch.object(
+            evaluator,
+            "_call_structured_json",
+            return_value=summary,
+        ) as request:
+            result = evaluator.summarize_merged_advisory({
+                "source_references": [{
+                    "source_name": "Source A",
+                    "content": "The flaw permits remote code execution.",
+                }],
+            })
+
+        self.assertEqual(result, summary)
+        self.assertEqual(request.call_args.args[1], set(summary))
+
+    def test_script_noise_is_excluded_from_affected_product_extraction(self):
+        evaluator = SecurityAIEvaluator(api_key="", openai_api_key="")
+
+        products, versions = evaluator._get_affected_details(
+            {
+                "affected_products": (
+                    "Ignite: window.ytcfg.set('EMERGENCY_BASE_URL', '/error')"
+                ),
+                "affected_versions": "",
+            },
+            "Ignite security issue.\nwindow.ytcfg.set('EMERGENCY_BASE_URL', '/error')",
+            "Ignite",
+        )
+
+        self.assertEqual(products, "Ignite")
+        self.assertEqual(versions, "")
+
+    def test_report_builder_drops_script_noise_and_unverified_rce_claims(self):
+        exporter = AdvisoryExcelExporter()
+
+        summary = exporter._build_report_summary({
+            "advisory_heading": "Ignite advisory",
+            "report_summary": (
+                "window.ytcfg.set('EMERGENCY_BASE_URL', '/error');\n"
+                "Allows remote attackers to execute arbitrary code on Ignite."
+            ),
+            "impact_summary": (
+                "[Remote Code Execution (RCE)] Allows remote attackers to execute "
+                "arbitrary code on Ignite."
+            ),
+            "source_content": (
+                "window.ytcfg.set('EMERGENCY_BASE_URL', '/error'); "
+                "(function(){window.yterr=true;}"
+            ),
+            "matched_app_name": "Ignite",
+            "severity": "HIGH",
+            "cvss_score": "8.2",
+        })
+
+        self.assertNotIn("window.", summary)
+        self.assertNotIn("remote attackers", summary.casefold())
+        self.assertNotIn("Remote Code Execution", exporter._infer_threat_classification({
+            "advisory_heading": "Ignite advisory",
+            "impact_summary": (
+                "[Remote Code Execution (RCE)] Allows remote attackers to execute "
+                "arbitrary code on Ignite."
+            ),
+            "source_content": "window.ytcfg.set('EMERGENCY_BASE_URL', '/error');",
+            "advisory_type": "Actionable",
+        }))
+
+    def test_locked_workbook_save_does_not_create_timestamped_duplicate(self):
+        exporter = AdvisoryExcelExporter()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "master.xlsx"
+            workbook = openpyxl.Workbook()
+            workbook.save(target)
+
+            with patch.object(Path, "replace", side_effect=PermissionError("locked")):
+                with self.assertRaisesRegex(RuntimeError, "is open"):
+                    exporter._safe_save(workbook, target, replace_existing=True)
+
+            self.assertEqual(list(Path(temp_dir).glob("master*.xlsx")), [target])
+            workbook.close()
+
+    def test_source_references_and_duplicate_flag_survive_workbook_round_trip(self):
+        exporter = AdvisoryExcelExporter()
+        references = [
+            {
+                "source_name": "Source A",
+                "link": "https://a.example/advisory",
+                "title": "Ignite advisory",
+            },
+            {
+                "source_name": "Source B",
+                "link": "https://b.example/advisory",
+                "title": "Ignite security update",
+            },
+        ]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir) / "Daily.xlsx"
+            exporter.export_daily(str(output), [{
+                "id": "article-a",
+                "source_name": "Source A",
+                "link": "https://a.example/advisory",
+                "advisory_heading": "Ignite advisory",
+                "source_references": references,
+                "duplicate_note": "Possible duplicate; compare before selecting.",
+            }])
+
+            workbook = openpyxl.load_workbook(output, data_only=True)
+            summary = workbook["Summary"]
+            columns = {cell.value: cell.column for cell in summary[1] if cell.value}
+            record = exporter.read_summary_records(str(output))[0]
+            self.assertEqual(record["source_references"], references)
+            self.assertIn("Possible duplicate", record["duplicate_note"])
+            self.assertIn(
+                "https://b.example/advisory",
+                summary.cell(2, columns["Other Sources"]).value,
+            )
+            workbook.close()
+
+    def test_merged_source_urls_are_visible_and_primary_link_is_clickable(self):
+        exporter = AdvisoryExcelExporter()
+        references = [
+            {
+                "article_id": "article-a",
+                "source_name": "Source A",
+                "link": "https://a.example/advisory",
+                "title": "Ignite advisory",
+                "content": "The issue affects Apache Ignite.",
+            },
+            {
+                "article_id": "article-b",
+                "source_name": "Source B",
+                "link": "https://b.example/advisory",
+                "title": "Ignite security update",
+                "content": "The issue exposes stored credentials.",
+            },
+        ]
+        record = {
+            "id": "article-a",
+            "advisory_id": "ADV-123",
+            "member_article_ids": ["article-a", "article-b"],
+            "source_name": "Source A",
+            "link": "https://a.example/advisory",
+            "advisory_heading": "Ignite advisory",
+            "advisory_type": "Actionable",
+            "source_references": references,
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            daily = Path(temp_dir) / "Daily.xlsx"
+            master = Path(temp_dir) / "Master.xlsx"
+            exporter.export_daily(str(daily), [record])
+
+            workbook = openpyxl.load_workbook(daily, data_only=False)
+            summary = workbook["Summary"]
+            columns = {cell.value: cell.column for cell in summary[1] if cell.value}
+            link_cell = summary.cell(2, columns["Link of Advisory"])
+            self.assertEqual(
+                link_cell.value,
+                "https://a.example/advisory\nhttps://b.example/advisory",
+            )
+            self.assertEqual(link_cell.hyperlink.target, "https://a.example/advisory")
+            self.assertIn(
+                "Source B: https://b.example/advisory",
+                summary.cell(2, columns["Other Sources"]).value,
+            )
+            workbook.close()
+
+            exporter.append_to_master(str(master), [record])
+            persisted = exporter.read_summary_records(str(master))[0]
+            self.assertEqual(persisted["source_references"], references)
+            self.assertEqual(persisted["advisory_id"], "ADV-123")
+            self.assertEqual(persisted["member_article_ids"], ["article-a", "article-b"])
+            workbook = openpyxl.load_workbook(master, data_only=False)
+            summary = workbook["Summary"]
+            columns = {cell.value: cell.column for cell in summary[1] if cell.value}
+            self.assertEqual(
+                summary.cell(2, columns["Link of Advisory"]).value,
+                "https://a.example/advisory\nhttps://b.example/advisory",
+            )
+            self.assertEqual(
+                summary.cell(2, columns["Link of Advisory"]).hyperlink.target,
+                "https://a.example/advisory",
+            )
+            workbook.close()
+
+    def test_master_update_adds_sources_to_existing_record_without_duplicate_row(self):
+        exporter = AdvisoryExcelExporter()
+        primary = {
+            "id": "article-a",
+            "source_name": "Source A",
+            "link": "https://a.example/advisory",
+            "advisory_heading": "Ignite advisory CVE-2026-12345",
+            "advisory_type": "Actionable",
+            "matched_app_name": "Apache Ignite",
+            "cve_details": "CVE-2026-12345",
+            "source_references": [{
+                "source_name": "Source A",
+                "link": "https://a.example/advisory",
+                "title": "Ignite advisory CVE-2026-12345",
+            }],
+        }
+        updated = {
+            **primary,
+            "source_references": [
+                *primary["source_references"],
+                {
+                    "source_name": "Source B",
+                    "link": "https://b.example/advisory",
+                    "title": "Ignite security update CVE-2026-12345",
+                },
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            master = Path(temp_dir) / "Master.xlsx"
+            exporter.append_to_master(str(master), [primary])
+            exporter.append_to_master(
+                str(master),
+                [updated],
+                preserve_review_decisions=True,
+                replace_existing=True,
+            )
+
+            records = exporter.read_summary_records(str(master))
+            workbook = openpyxl.load_workbook(master, data_only=True)
+            summary = workbook["Summary"]
+            columns = {cell.value: cell.column for cell in summary[1] if cell.value}
+            other_sources = summary.cell(2, columns["Other Sources"]).value
+            workbook.close()
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(len(records[0]["source_references"]), 2)
+        self.assertIn("https://b.example/advisory", other_sources)
+
+    def test_master_rebuild_replaces_today_rows_and_keeps_older_rows(self):
+        exporter = AdvisoryExcelExporter()
+        today = datetime.now().date()
+        yesterday = today - timedelta(days=1)
+        old_today = {
+            "id": "old-today",
+            "source_name": "Source A",
+            "advisory_heading": "Old today advisory",
+            "advisory_type": "Actionable",
+            "recorded_date": f"{today.isoformat()} 09:00",
+        }
+        older = {
+            "id": "older",
+            "source_name": "Source A",
+            "advisory_heading": "Older advisory",
+            "advisory_type": "Actionable",
+            "recorded_date": f"{yesterday.isoformat()} 09:00",
+        }
+        replacement = {
+            "id": "new-today",
+            "source_name": "Source B",
+            "advisory_heading": "Rebuilt today advisory",
+            "advisory_type": "Actionable",
+            "recorded_date": f"{today.isoformat()} 14:00",
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            master = Path(temp_dir) / "Master.xlsx"
+            exporter.append_to_master(str(master), [old_today, older])
+            exporter.append_to_master(
+                str(master),
+                [replacement],
+                replace_existing=True,
+                replace_recorded_date=today,
+            )
+
+            records = exporter.read_summary_records(str(master))
+
+        self.assertEqual(
+            {record["advisory_heading"] for record in records},
+            {"Older advisory", "Rebuilt today advisory"},
+        )
+        self.assertEqual(
+            next(
+                record["recorded_date"]
+                for record in records
+                if record["advisory_heading"] == "Rebuilt today advisory"
+            ),
+            f"{today.isoformat()} 14:00",
+        )
 
     def test_information_only_workbook_lists_records_on_its_summary(self):
         exporter = AdvisoryExcelExporter()
@@ -563,6 +1001,67 @@ class ReportEnrichmentTests(unittest.TestCase):
             self.assertEqual(link_cell.hyperlink.target, updated_record["link"])
             self.assertEqual(info_sheet.max_row, 2)
             workbook.close()
+
+    def test_existing_master_entry_updates_merged_impact_and_report_summaries(self):
+        exporter = AdvisoryExcelExporter()
+        record = {
+            "id": "article-merge-001",
+            "advisory_heading": "Example Platform remote code execution CVE-2026-12345",
+            "source_name": "Vendor A",
+            "link": "https://example.test/advisory-a",
+            "severity": "HIGH",
+            "published_timestamp": 1790000000,
+            "impact_summary": "Attackers can execute code in Example Platform.",
+            "matched_app_name": "Example Platform",
+            "advisory_type": "Actionable",
+            "cve_details": "CVE-2026-12345",
+            "cve_risk_score": "NA",
+            "attack_vector": "NA",
+            "av_type": "NA",
+            "iocs": "NA",
+            "affected_versions": "2.0.0",
+            "recommendation": "Install the vendor update.",
+            "report_summary": "The flaw affects Example Platform 2.0.0.",
+            "source_content": (
+                "Example Platform CVE-2026-12345 allows remote code execution."
+            ),
+        }
+        merged_record = dict(
+            record,
+            source_references=[
+                {
+                    "source_name": "Vendor A",
+                    "link": "https://example.test/advisory-a",
+                    "title": record["advisory_heading"],
+                },
+                {
+                    "source_name": "Vendor B",
+                    "link": "https://example.test/advisory-b",
+                    "title": "Example Platform security update",
+                },
+            ],
+            cve_details="CVE-2026-12345, CVE-2026-54321",
+            impact_summary=(
+                "Attackers can execute code in Example Platform. "
+                "The weakness can expose stored credentials."
+            ),
+            report_summary=(
+                "The flaw affects Example Platform 2.0.0. "
+                "The weakness can expose stored credentials."
+            ),
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir) / "master.xlsx"
+            exporter.append_to_master(str(output), [record])
+            exporter.append_to_master(str(output), [merged_record])
+
+            saved_record = exporter.read_summary_records(str(output))[0]
+
+        self.assertIn("expose stored credentials", saved_record["impact_summary"])
+        self.assertIn("expose stored credentials", saved_record["report_summary"])
+        self.assertIn("CVE-2026-54321", saved_record["cve_details"])
+        self.assertIn("Vendor B", saved_record["source_references"][1]["source_name"])
 
     def test_master_deduplicates_by_article_id_when_heading_changes(self):
         exporter = AdvisoryExcelExporter()

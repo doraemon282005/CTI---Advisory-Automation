@@ -7,7 +7,7 @@ import openpyxl
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
-from inventory_manager import NameListMatcher
+from inventory_manager import ApplicationInventory, NameListMatcher
 from excel_exporter import AdvisoryExcelExporter
 from pipeline import (
     process_reviewed_advisory_groups,
@@ -46,6 +46,23 @@ class RoutingTests(unittest.TestCase):
             )
             self.assertEqual(matcher.match("Example Telecommunications"), [])
             self.assertEqual(matcher.match("V.tal security advisory"), ["V.tal"])
+
+    def test_inventory_additions_are_loaded_from_updated_workbook(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "inventory.xlsx"
+            self._write_workbook(path, [
+                ["Application Name"],
+                ["Newly Added Platform"],
+            ])
+
+            inventory = ApplicationInventory(str(path))
+
+            matches = inventory.match(
+                "Newly Added Platform security advisory CVE-2026-54321",
+                "A vulnerability affects this platform.",
+            )
+
+        self.assertEqual(matches[0]["application_name"], "Newly Added Platform")
 
     def test_headerless_vendor_workbook_keeps_first_name(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -352,7 +369,9 @@ class RoutingTests(unittest.TestCase):
                 }
 
             exporter = FakeExporter()
-            results = process_reviewed_advisory_groups(exporter, groups)
+            results = process_reviewed_advisory_groups(
+                exporter, groups, pending_days=7, ai_evaluator=None
+            )
 
         self.assertEqual([result[0] for result in results], ["Telecom", "Miscellaneous"])
         self.assertEqual(
